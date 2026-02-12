@@ -2184,16 +2184,16 @@ class DailyReportGenerator:
                         ws[f'F{current_row}'] = f"[그래프2 생성 실패: {e}]"
                         ws[f'F{current_row}'].font = Font(size=10, color="FF0000")
 
-                    current_row += 8
+
+                    table_start_row  = current_row +2
+                    start_col = 1 # A열
 
                     # 표 삽입
                     headers = ['제품', 'Ref. 제품 불량률', '물량比 불량 Gap', '물량비 Gap', 'Ref.(6개월) 수량', '일 수량', 'Ref.(6개월) 물량비', '일 물량비']
-                    start_row = current_row +2
-                    start_col = 1
 
                     # 헤더 삽입
                     for c_idx, header in enumerate(headers, start_col):
-                        cell = ws.cell(row=start_row, column=c_idx, value=header)
+                        cell = ws.cell(row=table_start_row, column=c_idx, value=header)
                         cell.font = Font(bold=True, size=10)
                         cell.fill = PatternFill("solid", fgColor="D3D3D3")
                         cell.alignment = Alignment(horizontal='center', vertical='center')
@@ -2221,7 +2221,6 @@ class DailyReportGenerator:
                         if col in table_df_fmt.columns:
                             # 이미 숫자형이므로, % 표시를 위해 100으로 나눔
                             table_df_fmt[col] = pd.to_numeric(table_df_fmt[col], errors='coerce') / 100.0
-
 
                     # 데이터 삽입
                     for r_idx, row in enumerate(dataframe_to_rows(table_df_fmt, index=False, header=False), start_row + 1):
@@ -2255,10 +2254,10 @@ class DailyReportGenerator:
                                 except:
                                     pass
 
-                    for row in range(start_row, start_row + len(table_data) + 1):
+                    for row in range(table_start_row , table_start_row  + len(table_data) + 1):
                         ws.row_dimensions[row].height = 18
 
-                    current_row += len(table_data) + 3
+                    current_row = table_start_row + len(table_data) + 3
 
 
             # ──────────────────────────────────────────────────
