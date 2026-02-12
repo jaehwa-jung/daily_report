@@ -2186,79 +2186,79 @@ class DailyReportGenerator:
 
                     current_row += 8
 
-                    # # 표 삽입
-                    # headers = ['제품', 'Ref. 제품 불량률', '물량比 불량 Gap', '물량비 Gap', 'Ref.(6개월)', '일', 'Ref.(3개월)', '일']
-                    # start_row = current_row
-                    # start_col = 1
+                    # 표 삽입
+                    headers = ['제품', 'Ref. 제품 불량률', '물량比 불량 Gap', '물량비 Gap', 'Ref.(6개월) 수량', '일 수량', 'Ref.(6개월) 물량비', '일 물량비']
+                    start_row = current_row +2
+                    start_col = 1
 
-                    # # 헤더 삽입
-                    # for c_idx, header in enumerate(headers, start_col):
-                    #     cell = ws.cell(row=start_row, column=c_idx, value=header)
-                    #     cell.font = Font(bold=True, size=10)
-                    #     cell.fill = PatternFill("solid", fgColor="D3D3D3")
-                    #     cell.alignment = Alignment(horizontal='center', vertical='center')
-                    #     cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                    #                 top=Side(style='thin'), bottom=Side(style='thin'))
+                    # 헤더 삽입
+                    for c_idx, header in enumerate(headers, start_col):
+                        cell = ws.cell(row=start_row, column=c_idx, value=header)
+                        cell.font = Font(bold=True, size=10)
+                        cell.fill = PatternFill("solid", fgColor="D3D3D3")
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                    top=Side(style='thin'), bottom=Side(style='thin'))
 
-                    # table_data = [] # df_group에서 필요한 컬럼만 추출하여 새 테이블 생성
-                    # for _, row in df_group.iterrows():
-                    #     table_data.append({
-                    #         '제품': row['PRODUCT_TYPE'],
-                    #         'Ref. 제품 불량률': row['Ref_불량률(%)'],           # Ref. 제품 불량률
-                    #         '물량比 불량 Gap': row['불량률_GAP(%)'],            # 불량률 차이
-                    #         '물량비 Gap': row['물량비_GAP(%)'],                 # 물량비 차이
-                    #         'Ref.(6개월)': row['Ref_Compile_수량'],             # 6개월 Compile 수량
-                    #         '일': row['Daily_Compile_수량'],                    # 금일 Compile 수량
-                    #         'Ref.(3개월)': row['Ref_물량비(%)'],                # Ref 물량비 (%)
-                    #         '일': row['Daily_물량비(%)']                        # 금일 물량비 (%)
-                    #     })
+                    table_data = [] # df_group에서 필요한 컬럼만 추출하여 새 테이블 생성
+                    for _, row in df_group.iterrows():
+                        table_data.append({
+                            '제품': row['PRODUCT_TYPE'],
+                            'Ref. 제품 불량률': row['Ref_불량률(%)'],           # Ref. 제품 불량률
+                            '물량比 불량 Gap': row['물량비_불량GAP'],            # 불량률 차이
+                            '물량비 Gap': row['물량비_GAP(%)'],                 # 물량비 차이
+                            'Ref.(6개월) 수량': row['Ref_Compile_수량'],             # 6개월 Compile 수량
+                            '일 수량': row['Daily_Compile_수량'],                    # 금일 Compile 수량
+                            'Ref.(6개월) 물량비': row['Ref_물량비(%)'],                # Ref 물량비 (%)
+                            '일 물량비': row['Daily_물량비(%)']                        # 금일 물량비 (%)
+                        })
                     
-                    # table_df = pd.DataFrame(table_data, columns=headers)  # 컬럼 순서 보장
+                    table_df = pd.DataFrame(table_data, columns=headers)  # 컬럼 순서 보장
 
-                    # table_df_fmt = table_df.copy()
-                    # pct_columns = ['Ref. 제품 불량률', '물량比 불량 Gap', '물량비 Gap', 'Ref.(3개월)', '일']
-                    # for col in pct_columns:
-                    #     if col in table_df_fmt.columns:
-                    #         # 이미 숫자형이므로, % 표시를 위해 100으로 나눔
-                    #         table_df_fmt[col] = pd.to_numeric(table_df_fmt[col], errors='coerce') / 100.0
+                    table_df_fmt = table_df.copy()
+                    pct_columns = ['Ref. 제품 불량률', '물량比 불량 Gap', '물량비 Gap', 'Ref.(6개월) 물량비', '일 물량비']
+                    for col in pct_columns:
+                        if col in table_df_fmt.columns:
+                            # 이미 숫자형이므로, % 표시를 위해 100으로 나눔
+                            table_df_fmt[col] = pd.to_numeric(table_df_fmt[col], errors='coerce') / 100.0
 
 
-                    # # 데이터 삽입
-                    # for r_idx, row in enumerate(dataframe_to_rows(table_df_fmt, index=False, header=False), start_row + 1):
-                    #     for c_idx, value in enumerate(row, start_col):
-                    #         if isinstance(value, (np.integer, np.int64)):
-                    #             value = int(value)
-                    #         elif isinstance(value, (np.floating, np.float64)):
-                    #             value = float(value)
-                    #         elif isinstance(value, (np.bool_, bool)):
-                    #             value = bool(value)
-                    #         elif pd.isna(value):
-                    #             value = None
-                    #         cell = ws.cell(row=r_idx, column=c_idx, value=value)
-                    #         cell.font = Font(size=9)
-                    #         cell.alignment = Alignment(horizontal='center', vertical='center')
-                    #         cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                    #                     top=Side(style='thin'), bottom=Side(style='thin'))
+                    # 데이터 삽입
+                    for r_idx, row in enumerate(dataframe_to_rows(table_df_fmt, index=False, header=False), start_row + 1):
+                        for c_idx, value in enumerate(row, start_col):
+                            if isinstance(value, (np.integer, np.int64)):
+                                value = int(value)
+                            elif isinstance(value, (np.floating, np.float64)):
+                                value = float(value)
+                            elif isinstance(value, (np.bool_, bool)):
+                                value = bool(value)
+                            elif pd.isna(value):
+                                value = None
+                            cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                            cell.font = Font(size=9)
+                            cell.alignment = Alignment(horizontal='center', vertical='center')
+                            cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                        top=Side(style='thin'), bottom=Side(style='thin'))
 
-                    #         if c_idx in [11,12,13,14,15]:  # K, L열
-                    #             cell.number_format = '0.00%'
+                            if c_idx in [11,12,13,14,15]:  # K, L열
+                                cell.number_format = '0.00%'
 
-                    #         if c_idx == 11:  # 물량비_불량GAP
-                    #             try:
-                    #                 gap_val = float(value) if pd.notna(value) else 0.0
-                    #                 if gap_val > 0:
-                    #                     cell.fill = PatternFill("solid", fgColor="FFCCCC")
-                    #                     cell.font = Font(color="FF0000", bold=True, size=9)
-                    #                 elif gap_val < 0:
-                    #                     cell.fill = PatternFill("solid", fgColor="CCE5FF")
-                    #                     cell.font = Font(color="0000FF", bold=True, size=9)
-                    #             except:
-                    #                 pass
+                            if c_idx == 11:  # 물량비_불량GAP
+                                try:
+                                    gap_val = float(value) if pd.notna(value) else 0.0
+                                    if gap_val > 0:
+                                        cell.fill = PatternFill("solid", fgColor="FFCCCC")
+                                        cell.font = Font(color="FF0000", bold=True, size=9)
+                                    elif gap_val < 0:
+                                        cell.fill = PatternFill("solid", fgColor="CCE5FF")
+                                        cell.font = Font(color="0000FF", bold=True, size=9)
+                                except:
+                                    pass
 
-                    # for row in range(start_row, start_row + len(table_data) + 1):
-                    #     ws.row_dimensions[row].height = 18
+                    for row in range(start_row, start_row + len(table_data) + 1):
+                        ws.row_dimensions[row].height = 18
 
-                    # current_row += len(table_data) + 3
+                    current_row += len(table_data) + 3
 
 
             # ──────────────────────────────────────────────────
