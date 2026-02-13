@@ -1413,16 +1413,7 @@ class DailyReportGenerator:
                     else:
                         y_pos = height - 0.005
                         va = 'top'
-                    ax.text(
-                        bar.get_x() + bar.get_width() / 2,
-                        y_pos,
-                        f"{val:+.2f}%",
-                        ha='center',
-                        va=va,
-                        fontsize=9,
-                        fontweight='bold',
-                        color='black'
-                    )
+                    ax.text(bar.get_x() + bar.get_width() / 2, y_pos, f"{val:+.2f}%", ha='center', va=va, fontsize=9, fontweight='bold', color='black')
 
                 plt.tight_layout()
 
@@ -1474,16 +1465,7 @@ class DailyReportGenerator:
                 else:
                     y_pos = height - 0.005
                     va = 'top'
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    y_pos,
-                    f"{val:+.2f}%",
-                    ha='center',
-                    va=va,
-                    fontsize=9,
-                    fontweight='bold',
-                    color='black'
-                )
+                ax.text(bar.get_x() + bar.get_width() / 2,  y_pos, f"{val:+.2f}%",  ha='center',  va=va, fontsize=9,  fontweight='bold', color='black')
 
             plt.tight_layout()
             total_graph_path = debug_dir / "RC_HG_보상_전체.png"
@@ -1647,7 +1629,7 @@ class DailyReportGenerator:
                 else:
                     try:
                         img = ExcelImage(str(chart_path))
-                        img.width = 500
+                        img.width = 600
                         img.height = 350
                         ws.add_image(img, f'A{next_start_row + 1}')
                     except Exception as e:
@@ -1727,74 +1709,84 @@ class DailyReportGenerator:
             group_tables = mid_analysis.get('tables', {})
             detailed_analysis = data_3210_details.get('detailed_analysis', [])
 
-            # 1. 안전한 파싱
+            # 1. detailed_analysis 파싱 → 그룹별로 상세 코드 합치기
             groups = []
             current_group = None
-            current_items = []
+            current_code_dict = {}  # {code: [lot_info]}
 
             for line in detailed_analysis:
                 stripped = line.strip()
                 if not stripped:
                     continue
 
+                # 그룹 헤더 감지
                 if stripped.startswith("[") and "분석" in stripped:
-                    content = stripped.strip("[]")
-                    if " 분석" in content:
-                        current_group = content.replace(" 분석", "").strip()
-                    elif "분석" in content:
-                        current_group = content.replace("분석", "").strip()
-                    else:
-                        current_group = content.strip()
-
-                    if current_group and current_items:
-                        groups.append((current_group, current_items))
-                    current_items = []
+                    # 기존 그룹 저장
+                    if current_group and current_code_dict:
+                        groups.append((current_group, current_code_dict.copy()))
+                    # 새 그룹 초기화
+                    current_group = stripped.strip("[]").replace(" 분석", "").strip()
+                    current_code_dict = {}
+                    continue
+                # "열위 Lot" 포함된 라인 처리
+                if "열위 Lot" in stripped:
+                    # 코드 추출: "IPD_NG 열위 Lot" → "IPD_NG"
+                    parts = stripped.split(" 열위 Lot", 1)
+                    if len(parts) == 2:
+                        code = parts[0].strip()
+                        lot_info = parts[1].strip()
+                        if code not in current_code_dict:
+                            current_code_dict[code] = []
+                        current_code_dict[code].append(lot_info)
                     continue
 
-                if stripped.startswith("→  → "):
-                    judgment = stripped.replace("→  → ", "").strip()
-                    if current_items and isinstance(current_items[-1], dict):
-                        current_items[-1]['judgment'] = judgment
-                    continue
-
-                if stripped.startswith("→ ") and current_group:
+                # " - " 포함된 라인 처리 (예: "- ZDD [P]INTEL NAND Prime 165매")
+                if stripped.startswith("- "):
                     content = stripped[2:].strip()
-                    if content.startswith("- "):
-                        current_items.append({
-                            'type': 'sub',
-                            'content': content[2:].strip(),
-                            'details': [],
-                            'judgment': None
-                        })
-                    else:
-                        current_items.append({
-                            'type': 'item',
-                            'content': content,
-                            'judgment': None
-                        })
+                    if " " in content:
+                        code = content.split(" ", 1)[0].strip()
+                        lot_info = content[len(code):].strip()
+                        if code not in current_code_dict:
+                            current_code_dict[code] = []
+                        current_code_dict[code].append(lot_info)
                     continue
 
-                if ":" in stripped and current_items and isinstance(current_items[-1], dict):
-                    current_items[-1]['details'].append(stripped)
+            # 마지막 그룹 저장
+            if current_group and current_code_dict:
+                groups.append((current_group, current_code_dict))
 
-            if current_group and current_items:
-                groups.append((current_group, current_items))
-
-            # 2. 보고서 문장 생성
+            # 2. 재구성된 분석 문장 생성
             formatted_analysis = []
-            for i, (group_name, items) in enumerate(groups):
-                formatted_analysis.append(f"{i+1}. {group_name} 분석")
-                item_idx = 1
-                for item in items:
-                    if item['type'] == 'item':
-                        formatted_analysis.append(f"  {item_idx}) {item['content']}")
-                        item_idx += 1
-                    elif item['type'] == 'sub':
-                        details_str = ", ".join(item['details']) if item['details'] else ""
-                        judgment_str = f" → {item['judgment']}" if item.get('judgment') else ""
-                        combined = f"{item['content']} : {details_str}{judgment_str}".rstrip(" : ")
-                        formatted_analysis.append(f"  {item_idx}) {combined}")
-                        item_idx += 1
+
+            for group_name, code_dict in groups:
+                formatted_analysis.append(f"{group_name} 분석")
+                for code, lot_list in code_dict.items():
+                    # 콤마로 합치기
+                    lot_str = ", ".join(lot_list)
+                    formatted_analysis.append(f"{code} 열위 Lot: {lot_str}")
+
+            # 2. 재구성된 분석 문장 생성 (그룹 사이에 빈 행 추가)
+            formatted_analysis = []
+
+
+            if not groups:
+                formatted_analysis.append("분석 데이터 없음")
+            else:
+                for idx, (group_name, code_dict) in enumerate(groups):
+                    formatted_analysis.append(f"{group_name} 분석")
+                    for code, lot_list in code_dict.items():
+                        lot_str = ", ".join(lot_list)
+                        formatted_analysis.append(f"{code} 열위 Lot: {lot_str}")
+
+                    # idx 사용 
+                    if idx < len(groups) - 1:
+                        formatted_analysis.extend([""] * 3)  # 3줄 빈 행
+
+           # 3. Excel에 출력
+            start_detail_row = row_start + 1  # 그룹 헤더 아래부터 시작
+            for i, line in enumerate(formatted_analysis):
+                ws.cell(row=start_detail_row + i, column=15, value=line).font = Font(size=10)
+
 
             # 3. 그래프 + 표 + 분석 텍스트를 같은 행에 배치
             if not plot_paths:
@@ -2223,7 +2215,7 @@ class DailyReportGenerator:
                             table_df_fmt[col] = pd.to_numeric(table_df_fmt[col], errors='coerce') / 100.0
 
                     # 데이터 삽입
-                    for r_idx, row in enumerate(dataframe_to_rows(table_df_fmt, index=False, header=False), start_row + 1):
+                    for r_idx, row in enumerate(dataframe_to_rows(table_df_fmt, index=False, header=False), table_start_row + 1):
                         for c_idx, value in enumerate(row, start_col):
                             if isinstance(value, (np.integer, np.int64)):
                                 value = int(value)
@@ -2275,11 +2267,11 @@ class DailyReportGenerator:
             ws.column_dimensions['J'].width = 12
 
             # ──────────────────────────────────────────────────
-            # 6. 상세분석 텍스트 (A38 부터)
+            # 6. 상세분석 텍스트 
             # ──────────────────────────────────────────────────
-            start_detail_row = 38
+            start_detail_row = 46
             for i, line in enumerate(detailed_analysis):
-                ws.cell(row=start_detail_row + i, column=6, value=line).font = Font(size=10)
+                ws.cell(row=start_detail_row + i, column=15, value=line).font = Font(size=10)
 
             # ──────────────────────────────────────────────────
             # 7. 저장
