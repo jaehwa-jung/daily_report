@@ -424,24 +424,6 @@ class DailyReportGenerator:
         print(f"최종 출력: 각 REJ_GROUP별 GAP 상위 3개 제품")
         print(f"결과 (총 {len(final_result)} 건):\n{final_result}")
 
-        # # 8. CSV 저장 (전체 필터링 결과 + 최종 리포트용)
-        # try:
-        #     PROJECT_ROOT = Path(__file__).parent.parent
-        #     output_dir = PROJECT_ROOT / "validation_outputs"
-        #     output_dir.mkdir(exist_ok=True, parents=True)
-
-        #     current_date = datetime.now().strftime("%Y%m%d")
-        #     csv_path = output_dir / f"제품_영향성_GAP_{current_date}.csv"
-
-        #     # 전체 필터링 결과 저장 (디버깅용)
-        #     debug_output = filtered_gap.sort_values(['REJ_GROUP', '불량률_GAP(%)'], ascending=[True, False])
-        #     debug_output.to_csv(csv_path, index=False, encoding='utf-8-sig')
-        #     print(f"전체 필터링 결과 저장: {csv_path}")
-
-        # except Exception as e:
-        #     print(f"CSV 저장 실패: {e}")
-
-
         return final_result  
 
     def generate(self):
@@ -458,7 +440,7 @@ class DailyReportGenerator:
                     if 'PRODUCT_TYPE' in self.data[key].columns:
                         sample = self.data[key].sample(1)[['PROD_ID', 'PRODUCT_TYPE']].to_dict('records')
                 else:
-                    print(f"⚠️ {key} 없거나 빈 데이터")
+                    print(f"{key} 없거나 빈 데이터")
 
 
             product_influence_ref = self._create_product_influence_ref() #[신규] 제품 영향성 Ref 데이터 생성
@@ -484,16 +466,19 @@ class DailyReportGenerator:
             data_3210_3months = self._create_DATA_3210_wafering_300_3months()
             self.data['DATA_3210_wafering_300_3months'] = data_3210_3months  
 
-            data_waf_details = self._create_DATA_WAF_3210_wafering_300()
             data_lot_details = self._create_DATA_LOT_3210_wafering_300()
+            data_waf_details = self._create_DATA_WAF_3210_wafering_300()
+
+            DATA_1511_SMAX_wafering_300 = self.data.get('DATA_1511_SMAX_wafering_300')
 
             report = {
                 'DATA_3010_wafering_300' : data_3010_details,
                 'DATA_3210_wafering_300_details': data_3210_details,
                 'DATA_3210_wafering_300_3months': data_3210_3months,
-                'DATA_WAF_3210_wafering_300_details': data_waf_details,
                 'DATA_LOT_3210_wafering_300_details': data_lot_details,
+                'DATA_WAF_3210_wafering_300_details': data_waf_details,
                 'product_influence_gap' : product_influence_gap,
+                'DATA_1511_SMAX_wafering_300' : DATA_1511_SMAX_wafering_300,
                 'raw_data': self.data
             }
             
@@ -512,6 +497,7 @@ class DailyReportGenerator:
             logger.error(f"리포트 생성 실패: {e}")
             raise
     
+
     def _create_3010_wafering_300(self):
         """3010 수율 데이터 분석 및 그래프 생성 (WF RTY만, 최신 일실적 기준)"""
         details = {}
@@ -1124,16 +1110,6 @@ class DailyReportGenerator:
 
         return plot_paths
 
-    def _create_DATA_WAF_3210_wafering_300(self):
-        """3210 WAF 상세 분석"""
-        details = {}
-        key = 'DATA_WAF_3210_wafering_300'
-        if key in self.data and not self.data[key].empty:
-            df = self.data[key].copy()
-        else:
-            print("⚠️ DATA_WAF_3210_wafering_300 없거나 빈 데이터")
-
-        return details
     
     def _create_DATA_LOT_3210_wafering_300(self):
         """3210 LOT 상세 분석 - 캐시된 3개월 데이터 + self.data의 당일 데이터 모두 활용"""
@@ -1245,7 +1221,11 @@ class DailyReportGenerator:
 
             if avg_in_qty == 0:
                 print(" 분모(IN_QTY)가 0입니다. Loss Rate 계산 불가")
+                self.avg_in_qty = 0 # 인스턴스 변수에 0 저장
+                self.total_daily_qty = 0 # 인스턴스 변수에 0 저장
                 return details
+
+            self.avg_in_qty = avg_in_qty # 인스턴스 변수에 저장 → WAF 분석에서 사용
 
             # ===================================================================
             #  1. 전체 (Total) CRET_CD별 Loss Rate
@@ -1268,6 +1248,8 @@ class DailyReportGenerator:
                 total_daily_qty = denominator_daily['IN_QTY'].sum()  #  정의 추가
             else:
                 print("[self.data] DATA_LOT_3210_wafering_300 없거나 빈 데이터")
+
+            self.total_daily_qty = total_daily_qty # 인스턴스 변수에 저장
 
             # ===================================================================
             #  3.  전체 비교 표 생성 (모수 포함)
@@ -1496,6 +1478,381 @@ class DailyReportGenerator:
             details['rc_hg_avg_in_qty'] = 0
             details['rc_hg_gap_chart_path_by_group'] = {}
             details['rc_hg_gap_chart_path_total'] = ""
+            self.avg_in_qty = 0
+            self.total_daily_qty = 0
+        print(f"[LOT] self.avg_in_qty 저장 완료: {self.avg_in_qty}")
+        print(f"[LOT] self.total_daily_qty 저장 완료: {self.total_daily_qty}")
+
+        return details
+
+
+
+    def _create_DATA_WAF_3210_wafering_300(self):
+        """
+        3210 WAF 상세 분석 - 캐시된 3개월 데이터 + self.data의 당일 데이터 모두 활용
+        """
+        details = {}
+        PROJECT_ROOT = Path(__file__).parent.parent
+
+        # ===================================================================
+        # 1. [신규] data_cache에서 3개월 데이터 직접 로드 (장기 분석용)
+        # ===================================================================
+        base_date = (datetime.now().date() - timedelta(days=1))
+        target_months = []
+        current = base_date.replace(day=1)
+        for _ in range(3):
+            current = (current - timedelta(days=1)).replace(day=1)
+            month_str = current.strftime("%Y%m")
+            target_months.append(month_str)
+        target_months = sorted(target_months)  # 과거 → 최근
+
+        print(f"[WAF 캐시 필터링] 최근 3개월 대상 월: {target_months}")
+
+        cache_dir = PROJECT_ROOT / "data_cache"
+        pattern = "DATA_WAF_3210_wafering_300_*.parquet"
+        parquet_files = list(cache_dir.glob(pattern))
+
+        df_cached_3months = pd.DataFrame()
+
+        if parquet_files:
+            valid_files = []
+            for file_path in parquet_files:
+                try:
+                    stem = file_path.stem
+                    date_part = stem.split('_')[-1]  # '202506'
+
+                    if len(date_part) != 6 or not date_part.isdigit():
+                        continue
+
+                    file_ym = date_part
+                except Exception as e:
+                    print(f"[WAF 캐시] {file_path.name}에서 월 정보 추출 실패 → 건너뜀: {e}")
+                    continue
+
+                if file_ym in target_months:
+                    valid_files.append(file_path)
+
+            print(f"[WAF 캐시 필터링] 전체 {len(parquet_files)}개 중 대상 {len(valid_files)}개 파일 선정: {[f.name for f in valid_files]}")
+
+            dfs = []
+            for file_path in valid_files:
+                try:
+                    df_part = pd.read_parquet(file_path)
+                    print(f"[WAF 캐시] {file_path.name} 로드 완료: {len(df_part):,} 건")
+                    dfs.append(df_part)
+                except Exception as e:
+                    print(f"[WAF 캐시] {file_path.name} 읽기 실패: {e}")
+
+            if dfs:
+                df_cached_3months = pd.concat(dfs, ignore_index=True)
+                print(f"[WAF 캐시] 총 {len(df_cached_3months):,} 건 데이터 병합 완료")
+            else:
+                print("[WAF 캐시] 모든 파일 로드 실패 → 3개월 데이터 없음")
+        else:
+            print("[WAF 캐시] data_cache에 DATA_WAF_3210_wafering_300_*.parquet 파일 없음")
+
+        # ===================================================================
+        # 2. [기존] self.data에서 당일 데이터 사용
+        # ===================================================================
+        key = 'DATA_WAF_3210_wafering_300'
+        df_self_data = pd.DataFrame()
+        if key in self.data and not self.data[key].empty:
+            df_self_data = self.data[key].copy()
+            print(f"[self.data] {key} 데이터 건수: {len(df_self_data):,} 건")
+        else:
+            print(f"[self.data] {key} 없거나 빈 데이터")
+
+        # ===================================================================
+        # 3. [핵심] PRODUCT_TYPE 병합
+        # ===================================================================
+        if not df_cached_3months.empty:
+            df_cached_3months = self._merge_product_type(df_cached_3months)
+
+        if not df_self_data.empty:
+            df_self_data = self._merge_product_type(df_self_data)
+
+        print(f"[WAF] PRODUCT_TYPE 병합 완료: 3개월 {df_cached_3months['PRODUCT_TYPE'].notna().sum()}건, 당일 {df_self_data['PRODUCT_TYPE'].notna().sum()}건")
+
+
+        # ===================================================================
+        # 2. [기존] self.data에서 당일 데이터 사용 (실시간 리포트용)
+        # ===================================================================
+        df_self_data = pd.DataFrame()
+        if 'DATA_WAF_3210_wafering_300' in self.data and not self.data['DATA_WAF_3210_wafering_300'].empty:
+            df_self_data = self.data['DATA_WAF_3210_wafering_300']
+            print(f"[self.data] DATA_WAF_3210_wafering_300 데이터 건수: {len(df_self_data):,} 건")
+        else:
+            print("[self.data] DATA_WAF_3210_wafering_300 없거나 빈 데이터")
+
+        # ===================================================================
+        # [핵심] MS6 기반 PRODUCT_TYPE 병합
+        # ===================================================================
+        if not df_cached_3months.empty:
+            df_cached_3months = self._merge_product_type(df_cached_3months)
+
+        if not df_self_data.empty:
+            df_self_data = self._merge_product_type(df_self_data)
+
+        print(f"PRODUCT_TYPE 병합 완료: 3개월 {df_cached_3months['PRODUCT_TYPE'].notna().sum()}건, 당일 {df_self_data['PRODUCT_TYPE'].notna().sum()}건")
+
+
+        # ===================================================================
+        # 3. [핵심] 3개월 데이터 기반 Loss Rate 분석
+        # ===================================================================
+
+        avg_in_qty = getattr(self, 'avg_in_qty', 0)
+        total_daily_qty = getattr(self, 'total_daily_qty', 0)
+
+        if avg_in_qty == 0:
+            print(" 분모(IN_QTY)가 0입니다. Loss Rate 계산 불가")
+            return details
+        
+        if total_daily_qty == 0:
+            print("total_daily_qty = 0 → Daily 분석 생략 (Ref만 분석)")
+
+        # 공통 함수: 장비별 LOSS_QTY 합계 → 불량률 계산
+        def calculate_loss_rate(group_data, eqp_col, denominator):
+            if eqp_col not in group_data.columns or denominator == 0:
+                return {}
+            valid = group_data.dropna(subset=[eqp_col])
+            if valid.empty:
+                return {}
+            valid['LOSS_QTY'] = pd.to_numeric(valid['LOSS_QTY'], errors='coerce').fillna(0.0).astype(float)
+            loss_sum = valid.groupby(eqp_col)['LOSS_QTY'].sum()
+            return {eqp: round(qty / denominator * 100, 4) for eqp, qty in loss_sum.items()}
+
+        # ===================================================================
+        # [분석] Ref(3개월) 장비별 불량률 계산
+        # ===================================================================
+        ref_results = {}
+
+
+        # 1) PIT
+        df_pit = df_cached_3months[df_cached_3months['REJ_GROUP'] == 'PIT']
+        if not df_pit.empty:
+            rates = calculate_loss_rate(df_pit, 'EQP_NM_300_WF_3670', avg_in_qty)
+            ref_results['PIT'] = rates
+
+        # 2) SCRATCH
+        df_scratch = df_cached_3months[df_cached_3months['REJ_GROUP'] == 'SCRATCH']
+        if not df_scratch.empty:
+            eqps_scratch = ['EQP_NM_300_WF_3670', 'EQP_NM_300_WF_6100']
+            scratch_rates = {}
+            for eqp in eqps_scratch:
+                rates = calculate_loss_rate(df_scratch, eqp, avg_in_qty)
+                if rates:
+                    scratch_rates[eqp] = rates
+            ref_results['SCRATCH'] = scratch_rates
+
+        # 3) EDGE
+        df_edge = df_cached_3months[df_cached_3months['REJ_GROUP'] == 'EDGE']
+        if not df_edge.empty:
+            eqps = ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696', 'EQP_NM_300_WF_7000']
+            edge_rates = {}
+            for eqp in eqps:
+                rates = calculate_loss_rate(df_edge, eqp, avg_in_qty)
+                if rates:
+                    edge_rates[eqp] = rates
+            ref_results['EDGE'] = edge_rates
+
+        # 4) BROKEN
+        df_broken = df_cached_3months[df_cached_3months['REJ_GROUP'] == 'BROKEN']
+        if not df_broken.empty:
+            eqps = ['EQP_NM_300_WF_3670', 'EQP_NM_300_WF_6100', 'EQP_NM_300_WF_6500']
+            broken_rates = {}
+            for eqp in eqps:
+                rates = calculate_loss_rate(df_broken, eqp, avg_in_qty)
+                if rates:
+                    broken_rates[eqp] = rates
+            ref_results['BROKEN'] = broken_rates
+
+        # 5) CHIP
+        df_chip = df_cached_3months[df_cached_3months['REJ_GROUP'] == 'CHIP']
+        if not df_chip.empty:
+            chip_rates = {}
+            cond_edge = df_chip['AFT_BAD_RSN_CD'] == 'EDGE-CHIP'
+            cond_lap = df_chip['AFT_BAD_RSN_CD'] == 'CHIP-LAP'
+            cond_eg1af = df_chip['AFT_BAD_RSN_CD'] == 'CHIP_EG1AF'
+            cond_eg1bf = df_chip['AFT_BAD_RSN_CD'] == 'CHIP_EG1BF'
+
+            if not df_chip[cond_edge].empty:
+                for eqp in ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']:
+                    rates = calculate_loss_rate(df_chip[cond_edge], eqp, avg_in_qty)
+                    if rates:
+                        chip_rates[f'EDGE-CHIP_{eqp}'] = rates
+            if not df_chip[cond_lap].empty:
+                rates = calculate_loss_rate(df_chip[cond_lap], 'EQP_NM_300_WF_3670', avg_in_qty)
+                if rates:
+                    chip_rates['CHIP-LAP_EQP_NM_300_WF_3670'] = rates
+            if not df_chip[cond_eg1af].empty:
+                for eqp in ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']:
+                    rates = calculate_loss_rate(df_chip[cond_eg1af], eqp, avg_in_qty)
+                    if rates:
+                        chip_rates[f'CHIP_EG1AF_{eqp}'] = rates
+            if not df_chip[cond_eg1bf].empty:
+                rates = calculate_loss_rate(df_chip[cond_eg1bf], 'EQP_NM_300_WF_3300', avg_in_qty)
+                if rates:
+                    chip_rates['CHIP_EG1BF_EQP_NM_300_WF_3300'] = rates
+            ref_results['CHIP'] = chip_rates
+
+        # 6) VISUAL
+        df_visual = df_cached_3months[df_cached_3months['REJ_GROUP'] == 'VISUAL']
+        if not df_visual.empty:
+            cond = df_visual['AFT_BAD_RSN_CD'].isin(['B_PARTICLE', 'B_PAR2'])
+            visual_filtered = df_visual[cond]
+            if not visual_filtered.empty:
+                rates = calculate_loss_rate(visual_filtered, 'EQP_NM_300_WF_6100', avg_in_qty)
+                ref_results['VISUAL'] = rates
+
+        # ===================================================================
+        # [분석] Daily 장비별 불량률 계산
+        # ===================================================================
+        daily_results = {}
+
+        if df_self_data.empty:
+            print("당일 데이터 없음 → Daily 분석 건너뜀")
+        else:
+            if total_daily_qty == 0:
+                print("당일 분모가 0 → Daily 분석 불가")
+            else:
+                df_pit_d = df_self_data[df_self_data['REJ_GROUP'] == 'PIT']
+                if not df_pit_d.empty:
+                    rates = calculate_loss_rate(df_pit_d, 'EQP_NM_300_WF_3670', total_daily_qty)
+                    daily_results['PIT'] = rates
+
+                # 2) SCRATCH
+                df_scratch_d = df_self_data[df_self_data['REJ_GROUP'] == 'SCRATCH']
+                if not df_scratch_d.empty:
+                    eqps_scratch = ['EQP_NM_300_WF_3670', 'EQP_NM_300_WF_6100']
+                    scratch_rates = {}
+                    for eqp in eqps_scratch:
+                        rates = calculate_loss_rate(df_scratch_d, eqp, avg_in_qty)
+                        if rates:
+                            scratch_rates[eqp] = rates
+                    daily_results['SCRATCH'] = scratch_rates
+
+                # 3) EDGE
+                df_edge_d = df_self_data[df_self_data['REJ_GROUP'] == 'EDGE']
+                if not df_edge_d.empty:
+                    eqps = ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696', 'EQP_NM_300_WF_7000']
+                    edge_rates = {}
+                    for eqp in eqps:
+                        rates = calculate_loss_rate(df_edge_d, eqp, total_daily_qty)
+                        if rates:
+                            edge_rates[eqp] = rates
+                    daily_results['EDGE'] = edge_rates
+
+                # 4) BROKEN
+                df_broken_d = df_self_data[df_self_data['REJ_GROUP'] == 'BROKEN']
+                if not df_broken_d.empty:
+                    eqps = ['EQP_NM_300_WF_3670', 'EQP_NM_300_WF_6100', 'EQP_NM_300_WF_6500']
+                    broken_rates = {}
+                    for eqp in eqps:
+                        rates = calculate_loss_rate(df_broken_d, eqp, total_daily_qty)
+                        if rates:
+                            broken_rates[eqp] = rates
+                    daily_results['BROKEN'] = broken_rates
+
+                # 5) CHIP
+                df_chip_d = df_self_data[df_self_data['REJ_GROUP'] == 'CHIP']
+                if not df_chip_d.empty:
+                    chip_rates = {}
+                    cond_edge = df_chip_d['AFT_BAD_RSN_CD'] == 'EDGE-CHIP'
+                    cond_lap = df_chip_d['AFT_BAD_RSN_CD'] == 'CHIP-LAP'
+                    cond_eg1af = df_chip_d['AFT_BAD_RSN_CD'] == 'CHIP_EG1AF'
+                    cond_eg1bf = df_chip_d['AFT_BAD_RSN_CD'] == 'CHIP_EG1BF'
+
+                    if not df_chip_d[cond_edge].empty:
+                        for eqp in ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']:
+                            rates = calculate_loss_rate(df_chip_d[cond_edge], eqp, total_daily_qty)
+                            if rates:
+                                chip_rates[f'EDGE-CHIP_{eqp}'] = rates
+                    if not df_chip_d[cond_lap].empty:
+                        rates = calculate_loss_rate(df_chip_d[cond_lap], 'EQP_NM_300_WF_3670', total_daily_qty)
+                        if rates:
+                            chip_rates['CHIP-LAP_EQP_NM_300_WF_3670'] = rates
+                    if not df_chip_d[cond_eg1af].empty:
+                        for eqp in ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']:
+                            rates = calculate_loss_rate(df_chip_d[cond_eg1af], eqp, total_daily_qty)
+                            if rates:
+                                chip_rates[f'CHIP_EG1AF_{eqp}'] = rates
+                    if not df_chip_d[cond_eg1bf].empty:
+                        rates = calculate_loss_rate(df_chip_d[cond_eg1bf], 'EQP_NM_300_WF_3300', total_daily_qty)
+                        if rates:
+                            chip_rates['CHIP_EG1BF_EQP_NM_300_WF_3300'] = rates
+                    daily_results['CHIP'] = chip_rates
+
+                # 6) VISUAL
+                df_visual_d = df_self_data[df_self_data['REJ_GROUP'] == 'VISUAL']
+                if not df_visual_d.empty:
+                    cond = df_visual_d['AFT_BAD_RSN_CD'].isin(['B_PARTICLE', 'B_PAR2'])
+                    visual_filtered = df_visual_d[cond]
+                    if not visual_filtered.empty:
+                        rates = calculate_loss_rate(visual_filtered, 'EQP_NM_300_WF_6100', avg_in_qty)
+                        daily_results['VISUAL'] = rates
+
+        # ===================================================================
+        # 8. Gap 계산 (각 공정별 상위 3개 장비만)
+        # ===================================================================
+        gap_results = {}
+
+        # 공정명 추출 함수 (예: 'EQP_NM_300_WF_3670' → '3670')
+        def extract_process(eqp_col):
+            import re
+            match = re.search(r'(\d{4})$', eqp_col)
+            return match.group(1) if match else eqp_col
+
+        for group, ref_dict in ref_results.items():
+            if group not in daily_results:
+                continue
+
+            daily_dict = daily_results[group]
+
+            # 단일 dict (PIT, VISUAL 등)
+            if not isinstance(next(iter(ref_dict.values()), {}), dict):
+                # 장비-불량률 리스트 생성
+                all_items = [(k, ref_dict.get(k, 0)) for k in set(ref_dict.keys()) | set(daily_dict.keys())]
+                # 불량률 기준 상위 3개
+                top3_keys = sorted(all_items, key=lambda x: x[1], reverse=True)[:3]
+                top3_keys = [k for k, v in top3_keys]
+
+                gap_dict = {k: round(float(daily_dict.get(k, 0)) - float(ref_dict.get(k, 0)), 4)
+                    for k in top3_keys}
+                gap_results[group] = gap_dict
+
+            else:
+                # 중첩 dict (SCRATCH, EDGE 등)
+                gap_sub = {}
+                for eqp_col, rates in ref_dict.items():
+                    if eqp_col not in daily_dict:
+                        continue
+                    daily_rates = daily_dict[eqp_col]
+
+                    # 장비-불량률 리스트 생성
+                    all_items = [(k, rates.get(k, 0)) for k in set(rates.keys()) | set(daily_rates.keys())]
+                    # 불량률 기준 상위 3개
+                    top3_keys = sorted(all_items, key=lambda x: x[1], reverse=True)[:3]
+                    top3_keys = [k for k, v in top3_keys]
+
+                gap_sub[eqp_col] = {
+                    k: round(
+                        float(daily_rates.get(k, 0)) - float(rates.get(k, 0)),
+                        4
+                    )
+                    for k in top3_keys
+                }
+                gap_results[group] = gap_sub
+
+        # ===================================================================
+        # 9. details에 저장
+        # ===================================================================
+        details['waf_analysis_ref'] = ref_results
+        details['waf_analysis_daily'] = daily_results
+        details['waf_analysis_gap'] = gap_results
+        details['df_cached_3months'] = df_cached_3months
+        details['df_self_data'] = df_self_data
+        details['avg_in_qty'] = avg_in_qty
+        details['total_daily_qty'] = total_daily_qty
 
         return details
 
@@ -2176,9 +2533,9 @@ class DailyReportGenerator:
                         ws[f'F{current_row}'] = f"[그래프2 생성 실패: {e}]"
                         ws[f'F{current_row}'].font = Font(size=10, color="FF0000")
 
-
-                    table_start_row  = current_row +2
-                    start_col = 1 # A열
+                    # 표 삽입: A123부터 시작 (고정 행 번호)
+                    table_start_row = 123  # 🎯 고정된 시작 행
+                    start_col = 1  # A열
 
                     # 표 삽입
                     headers = ['제품', 'Ref. 제품 불량률', '물량比 불량 Gap', '물량비 Gap', 'Ref.(6개월) 수량', '일 수량', 'Ref.(6개월) 물량비', '일 물량비']
@@ -2231,10 +2588,10 @@ class DailyReportGenerator:
                             cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
                                         top=Side(style='thin'), bottom=Side(style='thin'))
 
-                            if c_idx in [11,12,13,14,15]:  # K, L열
+                            if c_idx in [2,3,4,7,8]:  # K, L열
                                 cell.number_format = '0.00%'
 
-                            if c_idx == 11:  # 물량비_불량GAP
+                            if c_idx == 4:  # 물량비_불량GAP
                                 try:
                                     gap_val = float(value) if pd.notna(value) else 0.0
                                     if gap_val > 0:
@@ -2249,7 +2606,86 @@ class DailyReportGenerator:
                     for row in range(table_start_row , table_start_row  + len(table_data) + 1):
                         ws.row_dimensions[row].height = 18
 
-                    current_row = table_start_row + len(table_data) + 3
+                    current_row = table_start_row + len(table_data) + 3 #current_row 업데이트 (표 아래 3칸 여유)
+
+
+            # ──────────────────────────────────────────────────
+            # 7. [장비별 불량률 GAP 분석] 섹션
+            # ──────────────────────────────────────────────────
+            current_row = current_row + 5
+            ws[f'A{current_row}'] = "[장비별 불량률 GAP 분석]"
+            ws[f'A{current_row}'].font = Font(size=12, bold=True)
+            current_row += 2
+
+            # top3_rej_groups 가져오기
+            # top3_rej_groups = report.get('DATA_3210_wafering_300_details', {}).get('top3_rej_groups', [])
+            waf_gap_data = report.get('DATA_WAF_3210_wafering_300_details', {}).get('waf_analysis_gap', {})
+
+            # 분석 대상 그룹
+            top3_rej_groups = ['SCRATCH', 'BROKEN', 'CHIP']
+            valid_groups = [g for g in top3_rej_groups if g in ['PIT', 'SCRATCH', 'EDGE', 'BROKEN', 'CHIP', 'VISUAL']]
+
+            if not valid_groups:
+                ws[f'A{current_row}'] = "[WAF 분석: 상위 3개 그룹 중 대상 없음]"
+                ws[f'A{current_row}'].font = Font(size=10, color="FF0000")
+                current_row += 10
+            else:
+                for rej_group in valid_groups:
+                    if rej_group not in waf_gap_data:
+                        continue
+
+                    gap_data = waf_gap_data[rej_group]
+                    if not gap_data:
+                        continue
+
+                    chart_path = debug_dir / f"WAF_{rej_group}_gap_chart.png"
+
+                    try:
+                        fig, ax = plt.subplots(figsize=(6, 4))
+
+                        if isinstance(gap_data, dict) and isinstance(next(iter(gap_data.values())), dict):
+                            # 다중 장비 (SCRATCH, EDGE 등)
+                            for eqp_col, rates in gap_data.items():
+                                labels = list(rates.keys())
+                                values = [rates[k] for k in labels]
+                                colors = ['orange' if v > 0 else 'steelblue' if v < 0 else 'gray' for v in values]
+                                ax.bar(labels, values, color=colors, width=0.6, label=eqp_col)
+                        else:
+                            # 단일 장비 (PIT, VISUAL 등)
+                            labels = list(gap_data.keys())
+                            values = [gap_data[k] for k in labels]
+                            colors = ['orange' if v > 0 else 'steelblue' if v < 0 else 'gray' for v in values]
+                            ax.bar(labels, values, color=colors, width=0.6)
+
+                        ax.set_title(f'{rej_group} 장비별 불량률 GAP (Daily - Ref)', fontsize=12, fontweight='bold')
+                        ax.set_ylabel('GAP (%)', fontsize=10)
+                        ax.set_xlabel('장비', fontsize=10)
+                        ax.tick_params(axis='x', rotation=45)
+                        ax.grid(axis='y', linestyle='--', alpha=0.7)
+                        ax.set_ylim(
+                            min(-0.3, min([v for vs in (gap_data.values() if isinstance(gap_data, dict) and isinstance(next(iter(gap_data.values())), dict) else [gap_data]) for v in vs.values()]) - 0.1),
+                            max(0.3, max([v for vs in (gap_data.values() if isinstance(gap_data, dict) and isinstance(next(iter(gap_data.values())), dict) else [gap_data]) for v in vs.values()]) + 0.1)
+                        )
+
+                        # 값 표시
+                        for container in ax.containers:
+                            ax.bar_label(container, fmt='+%.2f%%', fontsize=9, fontweight='bold', color='black')
+
+                        plt.tight_layout()
+                        plt.savefig(chart_path, dpi=150, bbox_inches='tight')
+                        plt.close()
+
+                        if chart_path.exists():
+                            img = ExcelImage(str(chart_path))
+                            img.width = 400
+                            img.height = 200
+                            ws.add_image(img, f'A{current_row}')
+
+                    except Exception as e:
+                        ws[f'A{current_row}'] = f"[{rej_group} 그래프 생성 실패: {e}]"
+                        ws[f'A{current_row}'].font = Font(size=10, color="FF0000")
+
+                    current_row += 8
 
 
             # ──────────────────────────────────────────────────
