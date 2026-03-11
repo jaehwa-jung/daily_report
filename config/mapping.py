@@ -16,6 +16,10 @@ REJ_GROUP_TO_MID_MAPPING = {
         'TTV' : 'GBIR', 'STIR' : 'SFQR'
     },
 
+    'GR_보증' : {
+        'ZZZZ' : 'Lot보증'
+    },
+
     'SCRATCH' : {
         'F_SCRATCH' : 'Front Side', 'F_DSCRATCH' : 'Front Side', 'FMSCR' : 'Front Side',
         'B_SCRATCH' : 'Back Side', 'B_DSCRATCH' : 'Back Side', 'BMSCR' : 'Back Side', 'BNG' : 'Back Side'
