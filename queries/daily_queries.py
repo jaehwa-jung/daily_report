@@ -11,19 +11,43 @@ def get_runtime_config():
     return _RUNTIME_CONFIG.copy()
 
 
+
+def DATA_1511_SMAX_wafering_300(target_date, config):
+    """
+    SMAX 1511 보고서
+
+    """
+    # 날짜 포맷 변환
+    target_dt = datetime.strptime(target_date, '%Y%m%d')
+    start_dt = target_dt - timedelta(days=60)  # 60일 전
+    start_date = start_dt.strftime('%Y%m%d')   # '20251103'
+    end_date = target_date                      # '20260102'
+    return f"""
+select a.*, b.eqp_name 
+from oracle.pmdw_mgr.DM_FA_EQ_EQPPRDCMRS_S a
+left join oracle.oggzmgr.odb_deqp b
+on a.eqp_id = b.eqp_id 
+where 1=1
+and a.base_dt between '{start_date}' and '{end_date}'
+and a.ownr_cd = 'MFG'
+and a.cret_cd = 'FS'
+"""
+
+
 def DATA_3010_wafering_300(target_date, config):
     """
     3010 보고서
 
     """
     # 날짜 포맷 변환
+    today_date = datetime.now().strftime('%Y%m%d')
     target_date_nm = datetime.strptime(target_date, '%Y%m%d').strftime('%y-%m-%d')
     target_ym = target_date[:6]  # '202601'
     return f"""
 select *
 from Oracle.pmdw_mgr.DW_DMS_WFYLD a
 where 1=1
-and a.base_dt = '{target_date}'
+and a.base_dt = '{today_date}'
 and a.waf_size = '{config['waf_size']}'
 and a.prod_type = '{config['oper_div_l']}'
 """
@@ -235,7 +259,8 @@ ORDER BY HST_REG_DTTM DESC
 def DATA_3210_wafering_300(target_date, config):
     """
     팀별 Loss Rate 조회 쿼리 (300mm 웨이퍼링 공정 기준)
-    
+    Prime 제품
+
     Args:
         target_date (str): 조회 일자 ('YYYYMMDD' 형식, 예: '20260127')
         config (dict): 쿼리 설정값
@@ -307,7 +332,7 @@ DAILY_GOAL AS (
             AND YLD_DIV1_CD = '{config['oper_div_l']}'
             AND GOAL_DIV_CD = 'BAD-RATE'
             AND YLD_PLAN_TYPE = 'BP'
-            AND REF_DIV2 = '{config['grade_filter']}'
+            AND REF_DIV2 = 'P'
             AND BASE_YM = '{target_ym}'
     ) A
         ON A.BASE_YM = SUBSTR(Z.BASE_DT, 1, 6)
@@ -367,10 +392,10 @@ LOSS_INFO AS (
        AND B.OPER_ID = A.OPER_ID
        AND B.OPER_DIV_L = '{config['oper_div_l']}'
        AND B.FAC_ID IN ('{fac_ids_str}')
-    LEFT JOIN oracle.PMDW_MGR.DW_BA_MS_PROD_M D
+    INNER JOIN oracle.PMDW_MGR.DW_BA_MS_PROD_M D
         ON D.PROD_ID = A.PROD_ID 
        AND D.SPEC_DIV_CD = 'PS'
-       AND (D.GRD_CD_NM = '{config['grade_filter']}' OR D.GRD_CD_NM_PS = '{config['grade_filter']}')
+       AND D.GRD_CD_NM = 'P'
     LEFT JOIN (
         SELECT DPT_CD, TEAMGRP_NM, ROW_NUMBER() OVER (PARTITION BY DPT_CD ORDER BY SORT_SEQ) AS RN
         FROM TBL_DTP_GRP
@@ -420,6 +445,10 @@ LOSS_INFO AS (
        AND B.OPER_ID = A.OPER_ID
        AND B.OPER_DIV_L = '{config['oper_div_l']}'
        AND B.FAC_ID IN ('{fac_ids_str}')
+    INNER JOIN oracle.PMDW_MGR.DW_BA_MS_PROD_M D
+        ON D.PROD_ID = A.PROD_ID 
+       AND D.SPEC_DIV_CD = 'PS'
+       AND D.GRD_CD_NM = 'P'  -- ✅ 'PN' → 'P' 변경
     WHERE
         A.DIV_CD = 'COM_QTY'
         AND A.WAF_SIZE = '{config['waf_size']}'
@@ -504,85 +533,66 @@ ORDER BY BASE_DT_NM, REJ_GROUP, LOSS_QTY DESC
 """
 
 
-
 def DATA_3210_wafering_300_3months(target_date, config):
     """
-    3개월 평균 목표값 계산용 쿼리
-    기간: 2025-11-01 \~ 2026-01-31 (예시)
-    
+    기간 내 일별 Loss Rate 조회 (목표 제외)
+    - 기간: _RUNTIME_CONFIG['start_3m'] \\~ ['end_3m']
+    - 등급: 'P' (Prime) 제품 전용
+    - 출력: 일별 REJ_GROUP별 LOSS_RATIO, LOSS_QTY, MGR_QTY
+
     Args:
-        start_date: 조회 시작일 ('YYYYMMDD')
-        end_date: 조회 종료일 ('YYYYMMDD')
-        config: QUERY_CONFIG (waf_size, fac_ids 등)
+        target_date: 사용되지 않음 (호환성 유지용)
+        config: dict with 'waf_size', 'oper_div_l', 'fac_ids'
+
+    Returns:
+        str: Trino SQL query
     """
-    # 여기서는 전역 _RUNTIME_CONFIG 사용
     if 'start_3m' not in _RUNTIME_CONFIG or 'end_3m' not in _RUNTIME_CONFIG:
         raise ValueError("config에 'start_3m' 또는 'end_3m'이 없습니다.")
-    
-    # 날짜 포맷 변환
+
     start_3m = _RUNTIME_CONFIG['start_3m']
     end_3m = _RUNTIME_CONFIG['end_3m']
     fac_ids_str = "','".join(config['fac_ids'])
-    
+
     return f"""
 -- =============================================
--- [Trino] LossYieldService.SELECT_TEAM_LOSS_RATE (config 기반)
+-- [Trino] 일별 Loss Rate 조회 (config 기반, 목표 제외)
+-- 기간: {start_3m} \\~ {end_3m} | Wafer: {config['waf_size']} | Process: {config['oper_div_l']}
 -- =============================================
-WITH TBL_DTP_GRP AS (
-    SELECT *
-    FROM (
-        SELECT 
-            S2.TEAMGRP_NM, 
-            S2.SORT_SEQ, 
-            S1.DPT_CD, 
-            ROW_NUMBER() OVER (PARTITION BY S1.DPT_CD ORDER BY ST_DT DESC) AS M
-        FROM oracle.PMDW_MGR.DW_BA_CM_LOSSREJGRPDTL_M S1
-        JOIN oracle.PMDW_MGR.DW_BA_CM_LOSSREJGRP_M S2
-            ON S1.TEAMGRP_CD = S2.TEAMGRP_CD
-            AND S1.WAF_SIZE = S2.WAF_SIZE
-            AND S1.OPER_DIV_L = S2.OPER_DIV_L
-            AND S1.TARGET_DIV_CD IN ('A','L')
-            AND S1.WAF_SIZE = '{config['waf_size']}'
-            AND S1.OPER_DIV_L = '{config['oper_div_l']}'
-            AND S1.ED_DT >= '{start_3m}'
-            AND S1.ST_DT <= '{end_3m}'
-    ) A
-    WHERE M = 1
-),
-
--- 일자 목록 (단일 일자)
+WITH 
+-- 기간 정의: 일자 목록 생성
 DATE_LIST AS (
     SELECT 
-        '{target_date}' AS BASE_DT
+        DATE_FORMAT(d, '%Y%m%d') AS BASE_DT,
+        DATE_FORMAT(d, '%y-%m-%d') AS BASE_DT_NM
+    FROM (
+        SELECT sequence(
+            DATE '{start_3m[:4]}-{start_3m[4:6]}-{start_3m[6:]}',
+            DATE '{end_3m[:4]}-{end_3m[4:6]}-{end_3m[6:]}',
+            INTERVAL '1' DAY
+        ) AS seq
+    )
+    CROSS JOIN UNNEST(seq) AS t(d)
 ),
--- 일별 목표(GOAL) 조회
-DAILY_GOAL AS (
+-- 팀그룹 정보 (기간 내 유효한 정보)
+TBL_DTP_GRP AS (
     SELECT 
-        A.YLD_DIV3_CD AS REJ_GROUP,
-        'D' AS CATEGORY,
-        SUM(A.GOAL_VAL) AS GOAL_RATIO
-    FROM DATE_LIST Z
-    INNER JOIN (
-        SELECT DISTINCT
-            BASE_YM,
-            WAF_SIZE,
-            YLD_DIV1_CD,
-            YLD_DIV3_CD,
-            GOAL_DIV_CD,
-            YLD_PLAN_TYPE,
-            REF_DIV2,
-            GOAL_VAL
-        FROM oracle.PMDW_MGR.DW_BA_CM_YLDPLAN_M
-        WHERE 
-            WAF_SIZE = '{config['waf_size']}'
-            AND YLD_DIV1_CD = '{config['oper_div_l']}'
-            AND GOAL_DIV_CD = 'BAD-RATE'
-            AND YLD_PLAN_TYPE = 'BP'
-            AND REF_DIV2 = '{config['grade_filter']}'
-    ) A
-        ON A.BASE_YM = SUBSTR(Z.BASE_DT, 1, 6)
-    GROUP BY 
-        A.YLD_DIV3_CD
+        S1.DPT_CD, 
+        S2.TEAMGRP_NM, 
+        S2.SORT_SEQ,
+        DATE_PARSE(SUBSTR(S1.ST_DT, 1, 8), '%Y%m%d') AS ST_DATE,
+        DATE_PARSE(SUBSTR(S1.ED_DT, 1, 8), '%Y%m%d') AS ED_DATE
+    FROM oracle.PMDW_MGR.DW_BA_CM_LOSSREJGRPDTL_M S1
+    JOIN oracle.PMDW_MGR.DW_BA_CM_LOSSREJGRP_M S2
+        ON S1.TEAMGRP_CD = S2.TEAMGRP_CD
+       AND S1.WAF_SIZE = S2.WAF_SIZE
+       AND S1.OPER_DIV_L = S2.OPER_DIV_L
+    WHERE 
+        S1.WAF_SIZE = '{config['waf_size']}'
+        AND S1.OPER_DIV_L = '{config['oper_div_l']}'
+        AND S1.TARGET_DIV_CD IN ('A','L')
+        AND S1.ST_DT <= '{end_3m}'
+        AND S1.ED_DT >= '{start_3m}'
 ),
 -- REJ_GROUP 목록 추출
 REJ_GROUP_LIST AS (
@@ -603,7 +613,7 @@ REJ_GROUP_LIST AS (
           AND DIV_CD <> 'COM_QTY'
     ) A
 ),
--- Loss 및 ComQty 통합
+-- Loss 및 ComQty 통합 ('P' 제품 전용)
 LOSS_INFO AS (
     -- ---------------------------------------------------------- 분자: 불량량
     SELECT
@@ -624,35 +634,35 @@ LOSS_INFO AS (
         SELECT WAF_SIZE, FAC_ID, BASE_DT, OPER_ID, REJ_GROUP, DIV_CD, BEF_BAD_RSN_CD, AFT_BAD_RSN_CD, REAL_DPT_GROUP, LOSS_QTY, IN_QTY, PROD_ID, EQP_ID
         FROM oracle.PMDW_MGR.DM_PP_AC_TOTALFAULTDTLSTD_S
         WHERE WAF_SIZE = '{config['waf_size']}'
-        AND BASE_DT >= '{start_3m}'
-        AND BASE_DT <= '{end_3m}'
+          AND BASE_DT >= '{start_3m}'
+          AND BASE_DT <= '{end_3m}'
 
         UNION ALL
 
         SELECT WAF_SIZE, FAC_ID, BASE_DT, OPER_ID, REJ_GROUP, DIV_CD, BEF_BAD_RSN_CD, AFT_BAD_RSN_CD, REAL_DPT_GROUP, LOSS_QTY, IN_QTY, PROD_ID, EQP_ID
         FROM oracle.PMDW_MGR.DW_BA_CM_TOTALFAULTMANUAL_S
         WHERE WAF_SIZE = '{config['waf_size']}'
-        AND BASE_DT >= '{start_3m}'
-        AND BASE_DT <= '{end_3m}'
+          AND BASE_DT >= '{start_3m}'
+          AND BASE_DT <= '{end_3m}'
     ) A
     INNER JOIN oracle.PMDW_MGR.DW_BA_CM_STDPOPER_M B
         ON B.FAC_ID = A.FAC_ID 
        AND B.OPER_ID = A.OPER_ID
        AND B.OPER_DIV_L = '{config['oper_div_l']}'
        AND B.FAC_ID IN ('{fac_ids_str}')
-    LEFT JOIN oracle.PMDW_MGR.DW_BA_MS_PROD_M D
+    INNER JOIN oracle.PMDW_MGR.DW_BA_MS_PROD_M D
         ON D.PROD_ID = A.PROD_ID 
        AND D.SPEC_DIV_CD = 'PS'
-       AND (D.GRD_CD_NM = '{config['grade_filter']}' OR D.GRD_CD_NM_PS = '{config['grade_filter']}')
+       AND D.GRD_CD_NM = 'P'
     LEFT JOIN (
-        SELECT DPT_CD, TEAMGRP_NM, ROW_NUMBER() OVER (PARTITION BY DPT_CD ORDER BY SORT_SEQ) AS RN
+        SELECT DPT_CD, TEAMGRP_NM, ST_DATE, ED_DATE
         FROM TBL_DTP_GRP
-    ) E ON E.DPT_CD = A.REAL_DPT_GROUP AND E.RN = 1
+    ) E 
+        ON E.DPT_CD = A.REAL_DPT_GROUP
+       AND DATE_PARSE(A.BASE_DT, '%Y%m%d') BETWEEN E.ST_DATE AND E.ED_DATE
     WHERE
         A.DIV_CD <> 'COM_QTY'
         AND A.WAF_SIZE = '{config['waf_size']}'
-        AND BASE_DT >= '{start_3m}'
-        AND BASE_DT <= '{end_3m}'
         AND CONCAT(A.WAF_SIZE, B.OPER_DIV_L) NOT IN ('200WF', '300EPI')
     GROUP BY 
         A.WAF_SIZE, B.OPER_DIV_L, A.BASE_DT, A.REJ_GROUP,
@@ -680,27 +690,29 @@ LOSS_INFO AS (
         SELECT WAF_SIZE, FAC_ID, BASE_DT, OPER_ID, REJ_GROUP, DIV_CD, BEF_BAD_RSN_CD, AFT_BAD_RSN_CD, REAL_DPT_GROUP, LOSS_QTY, IN_QTY, PROD_ID, EQP_ID
         FROM oracle.PMDW_MGR.DM_PP_AC_TOTALFAULTDTLSTD_S
         WHERE WAF_SIZE = '{config['waf_size']}'
-        AND BASE_DT >= '{start_3m}'
-        AND BASE_DT <= '{end_3m}'
+          AND BASE_DT >= '{start_3m}'
+          AND BASE_DT <= '{end_3m}'
 
         UNION ALL
 
         SELECT WAF_SIZE, FAC_ID, BASE_DT, OPER_ID, REJ_GROUP, DIV_CD, BEF_BAD_RSN_CD, AFT_BAD_RSN_CD, REAL_DPT_GROUP, LOSS_QTY, IN_QTY, PROD_ID, EQP_ID
         FROM oracle.PMDW_MGR.DW_BA_CM_TOTALFAULTMANUAL_S
         WHERE WAF_SIZE = '{config['waf_size']}'
-        AND BASE_DT >= '{start_3m}'
-        AND BASE_DT <= '{end_3m}'
+          AND BASE_DT >= '{start_3m}'
+          AND BASE_DT <= '{end_3m}'
     ) A
     INNER JOIN oracle.PMDW_MGR.DW_BA_CM_STDPOPER_M B
         ON B.FAC_ID = A.FAC_ID 
        AND B.OPER_ID = A.OPER_ID
        AND B.OPER_DIV_L = '{config['oper_div_l']}'
        AND B.FAC_ID IN ('{fac_ids_str}')
+    INNER JOIN oracle.PMDW_MGR.DW_BA_MS_PROD_M D
+        ON D.PROD_ID = A.PROD_ID 
+       AND D.SPEC_DIV_CD = 'PS'
+       AND D.GRD_CD_NM = 'P'
     WHERE
         A.DIV_CD = 'COM_QTY'
         AND A.WAF_SIZE = '{config['waf_size']}'
-        AND BASE_DT >= '{start_3m}'
-        AND BASE_DT <= '{end_3m}'
         AND CONCAT(A.WAF_SIZE, B.OPER_DIV_L) NOT IN ('200WF', '300EPI')
     GROUP BY 
         A.WAF_SIZE, B.OPER_DIV_L, A.BASE_DT, 
@@ -711,6 +723,7 @@ MGR_LOSS_INFO AS (
     SELECT 
         Z.WAF_SIZE, 
         Z.OPER_DIV_L,
+        DATE_FORMAT(DATE_PARSE(Z.BASE_DT, '%Y%m%d'), '%y-%m-%d') AS BASE_DT_NM,
         Z.REJ_GROUP, 
         Z.AFT_BAD_RSN_CD, 
         Z.BEF_BAD_RSN_CD,
@@ -720,13 +733,14 @@ MGR_LOSS_INFO AS (
     FROM LOSS_INFO Z
     WHERE Z.DIV_CD = ''
     GROUP BY 
-        Z.WAF_SIZE, Z.OPER_DIV_L, Z.REJ_GROUP, Z.AFT_BAD_RSN_CD, Z.BEF_BAD_RSN_CD
+        Z.WAF_SIZE, Z.OPER_DIV_L, Z.BASE_DT, Z.REJ_GROUP, Z.AFT_BAD_RSN_CD, Z.BEF_BAD_RSN_CD
 ),
 -- MGR_COMQTY_INFO: REJ_GROUP_LIST 기반 MGR_QTY 복제
 MGR_COMQTY_INFO AS (
     SELECT 
         C.WAF_SIZE, 
         C.OPER_DIV_L,
+        C.BASE_DT_NM,
         R.REJ_GROUP,
         C.COM_QTY,
         C.MGR_QTY,
@@ -735,6 +749,7 @@ MGR_COMQTY_INFO AS (
         SELECT 
             Z.WAF_SIZE, 
             Z.OPER_DIV_L,
+            DATE_FORMAT(DATE_PARSE(Z.BASE_DT, '%Y%m%d'), '%y-%m-%d') AS BASE_DT_NM,
             SUM(Z.LOSS_QTY) AS COM_QTY,
             SUM(Z.MGR_QTY) AS MGR_QTY,
             'D' AS CATEGORY
@@ -745,33 +760,28 @@ MGR_COMQTY_INFO AS (
     ) C
     CROSS JOIN REJ_GROUP_LIST R
 ),
--- 최종 데이터 조합
+-- 최종 데이터 조합 (목표 제거)
 FINAL_DATA AS (
     SELECT 
         L.CATEGORY,
+        L.BASE_DT_NM,
         L.REJ_GROUP,
         L.AFT_BAD_RSN_CD,
         CAST(CASE WHEN C.MGR_QTY > 0 THEN CAST(L.LOSS_QTY AS DOUBLE) / NULLIF(C.MGR_QTY, 0) ELSE 0.0 END AS DECIMAL(24,16)) AS LOSS_RATIO,
-        CAST(COALESCE(G.GOAL_RATIO, 0.0) AS DECIMAL(24,16)) AS GOAL_RATIO,
-        CAST(COALESCE(G.GOAL_RATIO, 0.0) AS DECIMAL(24,16)) AS GOAL_RATIO_SUM,
-        CAST(CASE WHEN C.MGR_QTY > 0 THEN (CAST(L.LOSS_QTY AS DOUBLE) / NULLIF(C.MGR_QTY, 0)) - COALESCE(G.GOAL_RATIO, 0.0) ELSE -COALESCE(G.GOAL_RATIO, 0.0) END AS DECIMAL(24,16)) AS GAP_RATIO,
         L.LOSS_QTY,
         C.MGR_QTY,
-        CAST(NULL AS DECIMAL(24,16)) AS COM_QTY,
-        99999 AS SORT_CD,
         'N/A' AS PROD_GRP,
         'N/A' AS EQP_NM,
         'N/A' AS EQP_MODEL_NM,
         '일' AS CATEGORY_NAME
     FROM MGR_LOSS_INFO L
     LEFT JOIN MGR_COMQTY_INFO C
-       ON C.REJ_GROUP = L.REJ_GROUP
-    LEFT JOIN DAILY_GOAL G
-       ON G.REJ_GROUP = L.REJ_GROUP
+        ON C.BASE_DT_NM = L.BASE_DT_NM
+       AND C.REJ_GROUP = L.REJ_GROUP
 )
 -- 최종 출력
 SELECT * FROM FINAL_DATA
-ORDER BY REJ_GROUP, LOSS_QTY DESC
+ORDER BY BASE_DT_NM, REJ_GROUP, LOSS_QTY DESC
 """
 
 
@@ -1070,6 +1080,7 @@ QUERIES_BY_CATALOG = {
         'DATA_WAF_3210_wafering_300': DATA_WAF_3210_wafering_300,
         'DATA_3210_wafering_300': DATA_3210_wafering_300,
         'DATA_3210_wafering_300_3months' : DATA_3210_wafering_300_3months, #3개월 쿼리 추가
-        'DATA_LOT_3210_wafering_300' : DATA_LOT_3210_wafering_300
+        'DATA_LOT_3210_wafering_300' : DATA_LOT_3210_wafering_300,
+        'DATA_1511_SMAX_wafering_300' : DATA_1511_SMAX_wafering_300
     }
 }
