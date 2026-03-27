@@ -19,7 +19,7 @@ class TrinoDataLoader:
         self.catalogs_config = catalogs_config
         self.query_config = query_config
         self.connections = {}
-    
+
     def connect(self, catalog_name):
         """특정 catalog에 연결"""
         if catalog_name in self.connections:
@@ -317,5 +317,209 @@ def load_data_lot_3210_3months_cached(self, target_date_str=None):
         logger.warning("사용할 3개월 데이터 모두 조회 실패 → 빈 데이터프레임 반환")
         return pd.DataFrame()
 
+
+
+def load_data_waf_3210_3months_cached(self, target_date_str=None):
+    """
+    DATA_WAF_3210_wafering_300의 직전 7개월치 데이터를 캐싱하고,
+    최근 3개월치만 반환합니다.
+    """
+
+    # 프로젝트 루트: data_loader.py 기준 상위 2단계
+    PROJECT_ROOT = Path(__file__).parent.parent
+    cache_dir = PROJECT_ROOT / "data_cache"
+    cache_dir.mkdir(exist_ok=True)
+
+    logger.info(f"캐시 디렉토리: {cache_dir.absolute()}")
+
+    if target_date_str is None:
+        target_date_str = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+    target_dt = datetime.strptime(target_date_str, '%Y%m%d')
+
+    def get_last_n_months_range(n):
+        """현재 월 기준 직전 n개월 전체 기간 리스트 반환"""
+        months = []
+        current = target_dt
+        for _ in range(n):
+            # 해당 월의 시작일
+            start_of_month = current.replace(day=1)
+            # 종료일: 말일
+            if current.month == 12:
+                end_of_month = start_of_month.replace(year=current.year + 1, month=1) - timedelta(days=1)
+            else:
+                end_of_month = start_of_month.replace(month=current.month + 1) - timedelta(days=1)
+            months.append((
+                start_of_month.strftime('%Y%m%d'),
+                end_of_month.strftime('%Y%m%d')
+            ))
+            # 이전 달로 이동
+            if current.month == 1:
+                current = current.replace(year=current.year - 1, month=12)
+            else:
+                current = current.replace(month=current.month - 1)
+        return months[::-1]  # 과거 → 최근 순으로 정렬
+
+    # 1. 전체 다운로드 대상: 직전 7개월
+    download_months = get_last_n_months_range(10)
+    # 2. 최종 사용 대상: 최근 3개월
+    use_months = download_months[-3:]
+
+    data_frames_all = []  # 전체 다운로드 (7개월)
+    data_frames_used = []  # 실제 반환용 (3개월)
+
+    for start_dt, end_dt in download_months:
+        ym = start_dt[:6]
+        file_path = cache_dir / f"DATA_WAF_3210_wafering_300_{ym}.parquet"
+
+        # (1) 캐시 있으면 로드
+        if file_path.exists():
+            try:
+                logger.info(f"캐시에서 로드: {file_path.name}")
+                df = pd.read_parquet(file_path)
+                logger.info(f"로드 완료: {len(df):,} 건")
+                data_frames_all.append(df)
+                if (start_dt, end_dt) in use_months:
+                    data_frames_used.append(df)
+                continue
+            except Exception as e:
+                logger.warning(f"캐시 파일 손상 또는 읽기 실패: {file_path.name} → 재조회: {e}")
+
+        # (2) 캐시 없으면 Trino에서 조회
+        logger.info(f"Trino에서 조회 중: {start_dt} \~ {end_dt}")
+        try:
+            from queries.daily_queries import DATA_WAF_3210_wafering_300
+            dummy_query = DATA_WAF_3210_wafering_300(start_dt, self.query_config)
+            query = _modify_query_for_date_range(dummy_query, start_dt, end_dt)
+
+            conn = self.connect("oracle")
+            self.check_data_size_before_query(conn, query)
+            cur = conn.cursor()
+            cur.execute(query)
+            rows = cur.fetchall()
+            columns = [desc[0] for desc in cur.description]
+            df = pd.DataFrame(rows, columns=columns)
+            cur.close()
+
+            # 조회 후 캐시 저장
+            df.to_parquet(file_path, engine='pyarrow', index=False)
+            logger.info(f"캐시 저장 완료: {file_path.name} ({len(df):,} 건)")
+
+            data_frames_all.append(df)
+            if (start_dt, end_dt) in use_months:
+                data_frames_used.append(df)
+
+        except Exception as e:
+            logger.error(f"{start_dt}-{end_dt} 조회 실패: {e}")
+            continue
+
+    # 최종 반환: 최근 3개월 데이터만 결합
+    if data_frames_used:
+        combined_df = pd.concat(data_frames_used, ignore_index=True)
+        logger.info(f"최근 3개월 데이터 병합 완료: {len(combined_df):,} 건 (총 7개월 중)")
+        # ===================================================================
+        # [추가] 일별 parquet 파일 자동 저장 (Trend 분석용: 전체 데이터 저장)
+        # ===================================================================
+        daily_file_path = cache_dir / f"DATA_WAF_3210_wafering_300_{target_date_str}.parquet"
+        try:
+            if not daily_file_path.exists():
+                if 'BASE_DT' in combined_df.columns:
+                    daily_data = combined_df[combined_df['BASE_DT'] == target_date_str]
+                elif 'base_dt' in combined_df.columns:
+                    daily_data = combined_df[combined_df['base_dt'] == target_date_str]
+                else:
+                    daily_data = combined_df.copy()
+                    logger.warning(f"[Trend 캐시] BASE_DT 컬럼 없음 → 전체 데이터 저장: {daily_file_path.name}")
+
+                if len(daily_data) > 0:
+                    daily_data.to_parquet(daily_file_path, index=False, engine='pyarrow')
+                    logger.info(f"[Trend 캐시 저장] {daily_file_path.name} 생성 완료: {len(daily_data):,} 건")
+                else:
+                    logger.info(f"[Trend 캐시] {daily_file_path.name} → 저장할 데이터 없음 (0건)")
+            else:
+                logger.info(f"[Trend 캐시 존재] {daily_file_path.name} 이미 있음 → 저장 생략")
+        except Exception as e:
+            logger.warning(f"[Trend 캐시 저장 실패] {daily_file_path.name}: {e}")
+
+        return combined_df
+    else:
+        logger.warning("사용할 3개월 데이터 모두 조회 실패 → 빈 데이터프레임 반환")
+        return pd.DataFrame()
+
+
+def load_data_waf_3210_date_range(self, start_date: str, end_date: str):
+    """
+    특정 날짜 범위 (YYYYMMDD \~ YYYYMMDD) 에 대해 
+    DATA_WAF_3210_wafering_300 데이터를 일별로 조회하고, 
+    data_cache 폴더에 각각 저장합니다.
+    
+    예: load_data_waf_3210_date_range('20260301', '20260303')
+    → 3/1, 3/2, 3/3 데이터 각각 저장
+    """
+    # 프로젝트 루트 및 캐시 디렉토리
+    PROJECT_ROOT = Path(__file__).parent.parent
+    cache_dir = PROJECT_ROOT / "data_cache"
+    cache_dir.mkdir(exist_ok=True)
+
+    logger.info(f"[일별 데이터 저장] 기간: {start_date} \~ {end_date}")
+    
+    # 날짜 파싱
+    try:
+        start_dt = datetime.strptime(start_date, '%Y%m%d')
+        end_dt = datetime.strptime(end_date, '%Y%m%d')
+    except ValueError as e:
+        logger.error(f"날짜 형식 오류. YYYYMMDD 형식이어야 함: {start_date}, {end_date}")
+        raise e
+
+    # 쿼리 로드
+    from queries.daily_queries import DATA_WAF_3210_wafering_300
+
+    # 날짜별 순차 처리
+    current_dt = start_dt
+    while current_dt <= end_dt:
+        target_date_str = current_dt.strftime('%Y%m%d')
+        daily_file_path = cache_dir / f"DATA_WAF_3210_wafering_300_{target_date_str}.parquet"
+
+        # (1) 파일 존재 여부 확인 → 있으면 건너뜀
+        if daily_file_path.exists():
+            logger.info(f"[SKIP] 이미 존재함: {daily_file_path.name}")
+            current_dt += timedelta(days=1)
+            continue
+
+        # (2) 쿼리 생성 (BASE_DT 기준)
+        try:
+            logger.info(f"[조회 중] {target_date_str} 데이터")
+            query = DATA_WAF_3210_wafering_300(target_date_str, self.query_config)
+
+            # 연결 및 실행
+            conn = self.connect("oracle")
+            self.check_data_size_before_query(conn, query)
+            cur = conn.cursor()
+            cur.execute(query)
+            rows = cur.fetchall()
+            columns = [desc[0] for desc in cur.description]
+            df = pd.DataFrame(rows, columns=columns)
+            cur.close()
+
+            if df.empty:
+                logger.warning(f"[경고] {target_date_str} 데이터 없음 → 빈 파일 저장 안 함")
+                current_dt += timedelta(days=1)
+                continue
+
+            # (3) parquet 파일 저장
+            df.to_parquet(daily_file_path, index=False, engine='pyarrow')
+            logger.info(f"[저장 완료] {daily_file_path.name} → {len(df):,} 건")
+
+        except Exception as e:
+            logger.error(f"[실패] {target_date_str} 처리 중 오류: {e}")
+            # 실패해도 다음 날로 진행
+
+        # 다음 날짜
+        current_dt += timedelta(days=1)
+
+    logger.info(f"[완료] {start_date} \~ {end_date} 기간 데이터 저장 완료")
+
+
 # 메서드 바인딩
 TrinoDataLoader.load_data_lot_3210_3months_cached = load_data_lot_3210_3months_cached
+TrinoDataLoader.load_data_waf_3210_3months_cached = load_data_waf_3210_3months_cached
+TrinoDataLoader.load_data_waf_3210_date_range = load_data_waf_3210_date_range
