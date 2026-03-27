@@ -28,6 +28,12 @@ from oracle.pmdw_mgr.DM_FA_EQ_EQPPRDCMRS_S a
 left join oracle.oggzmgr.odb_deqp b
 on a.eqp_id = b.eqp_id 
 where 1=1
+and a.prod_id IS NOT NULL 
+AND a.prod_id LIKE '12%'                  
+AND a.prod_id NOT LIKE '12B%' 
+AND a.prod_id NOT LIKE '12E%'           
+AND a.prod_id NOT LIKE '12U%'               
+AND a.prod_id NOT LIKE '12V%'
 and a.base_dt between '{start_date}' and '{end_date}'
 and a.ownr_cd = 'MFG'
 and a.cret_cd = 'FS'
@@ -139,7 +145,7 @@ waf_blk_mapping AS (
     FROM oracle.PMDW_MGR.DW_QM_PW_WAFOPER_H
     WHERE HST_DIV_CD = 'OC'
       AND FAC_ID IN ('{fac_ids_str}')
-      AND OPER_ID IN ('3300','3335','3670','3696','6100','7000')
+      AND OPER_ID IN ('3300','3335','3670','3696','6100','6210','6500','7000')
       AND BASE_DT BETWEEN '{date_range_start}' AND '{target_date}'
       AND IGOT_ID IS NOT NULL
       AND WAF_SEQ IS NOT NULL
@@ -162,7 +168,7 @@ ope_history_all AS (
         ON eqp.EQP_ID = B.EQP_ID
     WHERE B.HST_DIV_CD = 'OC'
       AND B.FAC_ID IN ('{fac_ids_str}')
-      AND B.OPER_ID IN ('3200','3300','3335','3670','3696','6100','7000')
+      AND B.OPER_ID IN ('3300','3335','3670','3696','6100','6210','6500','7000')
       AND B.BASE_DT BETWEEN '{date_range_start}' AND '{target_date}'
       AND B.IGOT_ID IS NOT NULL
       AND (B.WAF_SEQ IS NOT NULL OR B.BLK_ID IS NOT NULL)
@@ -209,6 +215,12 @@ pivot_ope AS (
         MAX(CASE WHEN OPER_ID = '6100' THEN EQP_NM END) AS EQP_NM_300_WF_6100,
         MAX(CASE WHEN OPER_ID = '6100' THEN REG_DTTM END) AS REG_DTTM_300_WF_6100,
         MAX(CASE WHEN OPER_ID = '6100' THEN SLOT_NO END) AS SLOT_NO_300_WF_6100,
+        MAX(CASE WHEN OPER_ID = '6210' THEN EQP_NM END) AS EQP_NM_300_WF_6210,
+        MAX(CASE WHEN OPER_ID = '6210' THEN REG_DTTM END) AS REG_DTTM_300_WF_6210,
+        MAX(CASE WHEN OPER_ID = '6210' THEN SLOT_NO END) AS SLOT_NO_300_WF_6210,
+        MAX(CASE WHEN OPER_ID = '6500' THEN EQP_NM END) AS EQP_NM_300_WF_6500,
+        MAX(CASE WHEN OPER_ID = '6500' THEN REG_DTTM END) AS REG_DTTM_300_WF_6500,
+        MAX(CASE WHEN OPER_ID = '6500' THEN SLOT_NO END) AS SLOT_NO_300_WF_6500,
         MAX(CASE WHEN OPER_ID = '7000' THEN EQP_NM END) AS EQP_NM_300_WF_7000,
         MAX(CASE WHEN OPER_ID = '7000' THEN REG_DTTM END) AS REG_DTTM_300_WF_7000,
         MAX(CASE WHEN OPER_ID = '7000' THEN SLOT_NO END) AS SLOT_NO_300_WF_7000
@@ -238,6 +250,12 @@ final_with_all_history AS (
         p.EQP_NM_300_WF_6100,
         p.REG_DTTM_300_WF_6100,
         p.SLOT_NO_300_WF_6100,
+        p.EQP_NM_300_WF_6210,
+        p.REG_DTTM_300_WF_6210,
+        p.SLOT_NO_300_WF_6210,
+        p.EQP_NM_300_WF_6500,
+        p.REG_DTTM_300_WF_6500,
+        p.SLOT_NO_300_WF_6500,
         p.EQP_NM_300_WF_7000,
         p.REG_DTTM_300_WF_7000,
         p.SLOT_NO_300_WF_7000
