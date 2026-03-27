@@ -10,7 +10,7 @@ import matplotlib
 from pathlib import Path
 import base64
 from analysis.defect_analyzer import analyze_flatness, analyze_warp, analyze_growing, analyze_broken, analyze_nano, analyze_pit, analyze_scratch, analyze_chip, analyze_edge, analyze_HUMAN_ERR, analyze_VISUAL, analyze_NOSALE, analyze_OTHER, analyze_GR, analyze_sample,analyze_particle
-from config.mappings import REJ_GROUP_TO_MID_MAPPING
+from config.mappings import REJ_GROUP_TO_MID_MAPPING, NAME_TO_EQP, MID_TO_EQP
 import tempfile
 from inspect import signature
 import re
@@ -19,6 +19,7 @@ from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
 from matplotlib.ticker import PercentFormatter
+from decimal import Decimal
 
 # =========================================================
 # Excel Export Utilities (공통화: 이미지/표/시트 빌더)
@@ -44,123 +45,6 @@ CENTER_WRAP = Alignment(horizontal="center", vertical="center", wrap_text=True)
 LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
 HEADER_FILL = PatternFill("solid", fgColor="D3D3D3")
-
-
-def add_png_image(ws, image_path, anchor, width=None, height=None):
-    """PNG 파일 경로를 openpyxl Image로 삽입 (공통)."""
-    img = ExcelImage(str(image_path))
-    if width is not None:
-        img.width = width
-    if height is not None:
-        img.height = height
-    ws.add_image(img, anchor)
-    return img
-
-
-def fig_to_excel_image(fig, width=None, height=None, dpi=150):
-    """matplotlib figure를 메모리(PNG)로 렌더링 후 ExcelImage로 변환."""
-    bio = BytesIO()
-    fig.savefig(bio, format="png", dpi=dpi, bbox_inches="tight")
-    bio.seek(0)
-
-    # openpyxl Image는 경로 또는 PIL Image를 받을 수 있음 (버전에 따라 다름)
-    if PILImage is not None:
-        pil_img = PILImage.open(bio)
-        img = ExcelImage(pil_img)
-    else:
-        # PIL이 없으면 BytesIO를 임시파일로 처리하는 fallback
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp.write(bio.getvalue())
-            tmp_path = tmp.name
-        img = ExcelImage(tmp_path)
-
-    if width is not None:
-        img.width = width
-    if height is not None:
-        img.height = height
-    return img
-
-
-def write_df_table(
-    ws,
-    df,
-    start_row,
-    start_col,
-    *,
-    header_fill=HEADER_FILL,
-    header_font=HEADER_FONT,
-    body_font=BODY_FONT,
-    alignment=CENTER_WRAP,
-    border=_BORDER_THIN,
-    number_formats=None,  # 예: {"월 목표": "0.00%", "Gap(월)": "0.00%"}
-):
-    """DataFrame을 표 형태로 시트에 쓰는 공통 함수."""
-    if df is None or getattr(df, "empty", True):
-        ws.cell(start_row, start_col, "표 없음").font = Font(size=10, color="FF0000")
-        return start_row + 1
-
-    for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True), start_row):
-        for c_offset, value in enumerate(row):
-            c_idx = start_col + c_offset
-            cell = ws.cell(row=r_idx, column=c_idx, value=value)
-
-            cell.border = border
-            cell.alignment = alignment
-            if r_idx == start_row:
-                cell.font = header_font
-                cell.fill = header_fill
-            else:
-                cell.font = body_font
-
-                if number_formats:
-                    col_name = df.columns[c_offset] if c_offset < len(df.columns) else None
-                    fmt = number_formats.get(col_name) if col_name else None
-                    if fmt:
-                        cell.number_format = fmt
-
-    return start_row + len(df) + 1
-
-
-class SheetBuilder:
-    """시트에 순차적으로 내용을 쌓아가는 커서 기반 빌더."""
-    def __init__(self, ws, start_row=1, start_col=1):
-        self.ws = ws
-        self.row = start_row
-        self.col = start_col
-
-    def blank(self, n=1):
-        self.row += n
-        return self
-
-    def title(self, text, merge_from=None, merge_to=None, font=None, alignment=LEFT):
-        if font is None:
-            font = Font(size=14, bold=True)
-        if merge_from and merge_to:
-            self.ws.merge_cells(f"{merge_from}:{merge_to}")
-            cell = self.ws[merge_from]
-        else:
-            cell = self.ws.cell(self.row, self.col)
-        cell.value = text
-        cell.font = font
-        cell.alignment = alignment
-        if not (merge_from and merge_to):
-            self.row += 1
-        return self
-
-    def image_from_path(self, image_path, anchor, width=None, height=None):
-        add_png_image(self.ws, image_path, anchor, width=width, height=height)
-        return self
-
-    def table(self, df, start_row=None, start_col=None, **kwargs):
-        if start_row is None:
-            start_row = self.row
-        if start_col is None:
-            start_col = self.col
-        self.row = write_df_table(self.ws, df, start_row, start_col, **kwargs)
-        return self
-
-
 
 # 한글 폰트 설정
 matplotlib.rcParams['font.family'] = 'Malgun Gothic'  # Windows
@@ -191,72 +75,75 @@ class DailyReportGenerator:
     def __init__(self, data):
         self.data = data
 
-    def _calculate_product_influence(self, df, target_rej_groups):
-        """제품 영향성 공통 집계 로직 (Ref/Daily 공통)"""
+    def _calculate_total_loss_influence(self, df):
+        """
+        전체 불량 기준 제품 영향성 분석
+        - REJ_GROUP != '분모' 인 모든 LOSS_QTY 합산
+        - PRODUCT_TYPE별 전체 불량률 계산
+        """
         if df is None or getattr(df, "empty", True):
-            return pd.DataFrame()
+            return pd.DataFrame(), 0
 
         df = df.copy()
+        df = df[df['GRD_CD_NM_CS'] == 'Prime']
 
-        # 숫자 컬럼 타입 보정
+        # 전체 불량: '분모' 제외 모든 불량
+        df_total = df[df['REJ_GROUP'] != '분모']
+
         for col in ["IN_QTY", "LOSS_QTY"]:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype("int64")
+                df[col] = pd.to_numeric(df[col], errors="coerce")
             else:
                 df[col] = 0
 
-        # 1) 불량개수
-        df_defect = df[
-            df["REJ_GROUP"].isin(target_rej_groups) & (df["PRODUCT_TYPE"] != "Unknown")
-        ].copy()
+        # 전체 수량
+        denominator = df[df['REJ_GROUP'] == '분모']
+        total_qty = denominator['IN_QTY'].sum()
 
-        if df_defect.empty:
-            return pd.DataFrame()
+        df_total = df[df['REJ_GROUP']!= '분모']
 
-        defect_summary = (
-            df_defect.groupby(["REJ_GROUP", "PRODUCT_TYPE"], dropna=False)["LOSS_QTY"]
+        loss_summary = (
+            df_total.groupby("PRODUCT_TYPE", dropna=False)["LOSS_QTY"]
             .sum()
             .reset_index()
         )
-        defect_summary.rename(columns={"LOSS_QTY": "불량개수"}, inplace=True)
+        loss_summary.rename(columns={"LOSS_QTY": "전체_불량개수"}, inplace=True)
 
-        # 2) Compile 수량 (분모)
-        df_denom = df[(df["REJ_GROUP"] == "분모") & (df["PRODUCT_TYPE"] != "Unknown")].copy()
-        if df_denom.empty:
-            return pd.DataFrame()
-
+        # Compile 수량
         compile_summary = (
-            df_denom.groupby("PRODUCT_TYPE", dropna=False)["IN_QTY"]
+            df[df['REJ_GROUP'] == '분모']
+            .groupby("PRODUCT_TYPE", dropna=False)["IN_QTY"]
             .sum()
             .reset_index()
         )
         compile_summary.rename(columns={"IN_QTY": "Compile_수량"}, inplace=True)
+ 
 
-        total_volume = compile_summary["Compile_수량"].sum()
-        if total_volume == 0:
-            compile_summary["물량비(%)"] = 0.0
-        else:
-            compile_summary["물량비(%)"] = (compile_summary["Compile_수량"] / total_volume * 100).round(2)
+        # 병합
+        result = pd.merge(loss_summary, compile_summary, on="PRODUCT_TYPE", how="outer")
+        result["전체_불량개수"] = result["전체_불량개수"].fillna(0.0)
+        result["Compile_수량"] = result["Compile_수량"].fillna(0.0)
 
-        # 3) 병합
-        result = pd.merge(defect_summary, compile_summary, on="PRODUCT_TYPE", how="left")
+        # 물량비
+        result["물량비(%)"] = (
+            (result["Compile_수량"] / total_qty * 100) if total_qty > 0 else 0.0 #compile수량/전체수량 * 100 -> 이미 %로 변경함.
+        ).round(2)
 
-        # 4) 불량률 계산
-        if total_volume == 0:
-            result["불량률(%)"] = 0.0
-            result["전체 불량률(%)"] = 0.0
-        else:
-            result["불량률(%)"] = ((result["불량개수"] / result["Compile_수량"]) * 100).round(2)
-            result["전체 불량률(%)"] = ((result["불량개수"] / total_volume) * 100).round(2)
 
-        # 5) 최종 정리
-        result = result[
-            ["REJ_GROUP", "PRODUCT_TYPE", "불량개수", "Compile_수량", "불량률(%)", "전체 불량률(%)", "물량비(%)"]
-        ].sort_values(["REJ_GROUP", "불량률(%)"], ascending=[True, False])
+        # 제품별 전체 불량률
+        result["전체_불량률(%)"] = np.where(
+            result["Compile_수량"] > 0,
+            (result["전체_불량개수"] / result["Compile_수량"] ) * 100, # 각 제품별 불량률, 제품 불량 개수/ 제품 총 in 수량
+            0.0
+        ).round(2)
 
-        return result
+        result = result[[
+            "PRODUCT_TYPE", "전체_불량개수", "Compile_수량", "전체_불량률(%)", "물량비(%)"
+        ]].sort_values("전체_불량률(%)", ascending=False).reset_index(drop=True)
 
-    
+        return result, total_qty
+
+   
     # ──────────────────────────────────────────────────
     # [신규] MS6.csv 기반 제품 정보 병합 함수
     # ──────────────────────────────────────────────────
@@ -316,18 +203,14 @@ class DailyReportGenerator:
         """
         return self.data.get('DATA_3210_wafering_300', {}).get('top3_rej_groups', [])
 
-
-    def _create_product_influence_ref(self):
-        """전 반기(6개월) 데이터 기반 제품 영향성 Ref 데이터 생성"""
+    def _create_total_loss_ref(self):
+        """6개월 전체 불량 기반 Ref 데이터 생성"""
         PROJECT_ROOT = Path(__file__).parent.parent
         cache_dir = PROJECT_ROOT / "data_cache"
         pattern = "DATA_LOT_3210_wafering_300_*.parquet"
         parquet_files = list(cache_dir.glob(pattern))
 
-        # 대상 월 설정: 202506 ~ 202512
         target_months = [f"2025{str(m).zfill(2)}" for m in range(6, 13)]
-
-        target_rej_groups = ["PARTICLE", "FLATNESS", "NANO", "WARP&BOW", "GROWING", "SCRATCH", "VISUAL", "SAMPLE"]
 
         df_list = []
         for file_path in parquet_files:
@@ -337,143 +220,117 @@ class DailyReportGenerator:
                 if len(date_part) == 6 and date_part.isdigit() and date_part in target_months:
                     df_part = pd.read_parquet(file_path)
                     df_part = self._merge_product_type(df_part)
-
-                    for col in ["IN_QTY", "LOSS_QTY"]:
-                        if col in df_part.columns:
-                            df_part[col] = pd.to_numeric(df_part[col], errors="coerce").fillna(0).astype("int64")
-                        else:
-                            df_part[col] = 0
-
-                    if "PRODUCT_TYPE" not in df_part.columns:
-                        continue
                     df_list.append(df_part)
-            except Exception:
+            except Exception as e:
                 continue
 
         if not df_list:
-            return pd.DataFrame()
+            return pd.DataFrame(), 0
 
         df_full = pd.concat(df_list, ignore_index=True)
 
-        if "PRODUCT_TYPE" not in df_full.columns:
-            return pd.DataFrame()
+        return self._calculate_total_loss_influence(df_full)
 
-        return self._calculate_product_influence(df_full, target_rej_groups)
-
-    def _create_product_influence_daily(self):
-        """금일 DATA_LOT_3210_wafering_300 데이터 기반 제품 영향성 분석"""
+    def _create_total_loss_daily(self):
+        """금일 전체 불량 기반 Daily 데이터 생성"""
         key = "DATA_LOT_3210_wafering_300"
         if key not in self.data or self.data[key].empty:
-            return pd.DataFrame()
+            return pd.DataFrame(), 0
 
         df = self.data[key].copy()
-
         if "PRODUCT_TYPE" not in df.columns:
             df = self._merge_product_type(df)
             if "PRODUCT_TYPE" not in df.columns:
-                return pd.DataFrame()
+                return pd.DataFrame(), 0
 
-        target_rej_groups = ["PARTICLE", "FLATNESS", "NANO", "WARP&BOW", "GROWING", "SCRATCH", "VISUAL", "SAMPLE"]
-        return self._calculate_product_influence(df, target_rej_groups)
+        return self._calculate_total_loss_influence(df)
 
-    def _analyze_product_influence_gap(self):
+
+    def _analyze_total_loss_gap(self):
         """
-        제품별 불량률 GAP 분석: 6개월 기준(Ref) vs 금일(Daily)
-        - 기준: REJ_GROUP + PRODUCT_TYPE
-        - 출력: 불량률(%) GAP, 전체 불량률(%) GAP
-        - 필터: _get_top3_rej_groups() 기반
+        전체 불량률 기준 GAP 분석
+        - Daily 상위 3개 제품 기준 → Ref 비교
         """
-
-        # 1. Ref 데이터 확인
-        if 'product_influence_ref' not in self.data:
-            print("product_influence_ref 데이터 없음")
-            return pd.DataFrame()
-        
-        ref_df = self.data['product_influence_ref']
-        if ref_df.empty:
-            print("product_influence_ref 데이터가 비어 있음")
+        if 'total_loss_ref' not in self.data or 'total_loss_daily' not in self.data:
             return pd.DataFrame()
 
-        # 2. Daily 데이터 확인
-        if 'product_influence_daily' not in self.data:
-            print("product_influence_daily 데이터 없음")
-            return pd.DataFrame()
-        
-        daily_df = self.data['product_influence_daily']
-        if daily_df.empty:
-            print("product_influence_daily 데이터가 비어 있음")
+        ref_df = self.data['total_loss_ref']
+        daily_df = self.data['total_loss_daily']
+
+        if ref_df.empty or daily_df.empty:
             return pd.DataFrame()
 
-        # 3. 컬럼 선택 및 이름 변경
-        key_cols = ['REJ_GROUP', 'PRODUCT_TYPE']
-        ref = ref_df[key_cols + ['불량개수', 'Compile_수량','불량률(%)', '전체 불량률(%)', '물량비(%)']].copy()
-        ref.rename(columns={
-            '불량개수' : 'Ref_불량개수',
-            'Compile_수량' : 'Ref_Compile_수량',
-            '불량률(%)': 'Ref_불량률(%)',
-            '전체 불량률(%)': 'Ref_전체_불량률(%)',
-            '물량비(%)' : 'Ref_물량비(%)'
-        }, inplace=True)
+        # 전체 평균 불량률 
+        total_ref_qty = self.data.get('total_loss_ref_total_qty', 1)
+        total_daily_qty = self.data.get('total_loss_daily_total_qty', 1)
 
-        daily = daily_df[key_cols + ['불량개수', 'Compile_수량','불량률(%)', '전체 불량률(%)', '물량비(%)']].copy()
-        daily.rename(columns={
-            '불량개수' : 'Daily_불량개수',
-            'Compile_수량' : 'Daily_Compile_수량',
-            '불량률(%)': 'Daily_불량률(%)',
-            '전체 불량률(%)': 'Daily_전체_불량률(%)',
-            '물량비(%)' : 'Daily_물량비(%)'
-        }, inplace=True)
+        total_ref_loss = ref_df['전체_불량개수'].sum()
+        total_daily_loss = daily_df['전체_불량개수'].sum()
 
-        # 4. 병합 (외부 조인 → 누락 데이터 보존)
-        gap = pd.merge(daily, ref, on=key_cols, how='outer').fillna(0.0)
+        overall_ref_loss_rate = (total_ref_loss / total_ref_qty * 100) if total_ref_qty > 0 else 0.0
+        overall_daily_loss_rate = (total_daily_loss / total_daily_qty * 100) if total_daily_qty > 0 else 0.0
 
-        # 5. GAP 계산
-        gap['불량률_GAP(%)'] = (gap['Daily_불량률(%)'] - gap['Ref_불량률(%)']).round(2)
-        gap['전체_불량률_GAP(%)'] = (gap['Daily_전체_불량률(%)'] - gap['Ref_전체_불량률(%)']).round(2)
-        gap['물량비_GAP(%)'] = (gap['Daily_물량비(%)'] - gap['Ref_물량비(%)']).round(2)
-        gap['물량비_불량GAP'] = ((gap['Ref_불량률(%)'] - gap['Ref_전체_불량률(%)']) * gap['물량비_GAP(%)']).round(2)
+        gap_list = []
+        all_products = daily_df['PRODUCT_TYPE'].unique().tolist()
 
-        # 5. 상위 3개 REJ_GROUP 필터링
-        top3_rej_groups = self._get_top3_rej_groups()
-        if not top3_rej_groups:
-            print("상위 3개 REJ_GROUP 없음 → 전체 데이터 사용")
-            filtered_gap = gap
-        else:
-            print(f"필터링 기준: {top3_rej_groups}")
-            filtered_gap = gap[gap['REJ_GROUP'].isin(top3_rej_groups)]
+        # 전체 제품에 대해 GAP 계산
+        for pt in all_products:
+            row = {'PRODUCT_TYPE': pt}
 
-        if filtered_gap.empty:
-            print("필터링 후 데이터 없음")
-            return pd.DataFrame()
+            # Daily 데이터
+            daily_row = daily_df[daily_df['PRODUCT_TYPE'] == pt].iloc[0]
+            row.update({
+                'Daily_전체_불량률(%)': daily_row['전체_불량률(%)'],
+                'Daily_Compile_수량': daily_row['Compile_수량'],
+                'Daily_물량비(%)': daily_row['물량비(%)']
+            })
 
-        # 5. 각 REJ_GROUP별로 불량률_GAP(%) 기준 상위 3개씩 추출
-        top3_per_group_list = []
+            # Ref 데이터
+            ref_row = ref_df[ref_df['PRODUCT_TYPE'] == pt]
+            if not ref_row.empty:
+                ref_val = ref_row.iloc[0]
+                row['Ref_전체_불량률(%)'] = ref_val['전체_불량률(%)']
+                row['Ref_Compile_수량'] = ref_val['Compile_수량']
+                row['Ref_물량비(%)'] = ref_val['물량비(%)']
+            else:
+                row['Ref_전체_불량률(%)'] = 0.0
+                row['Ref_Compile_수량'] = 0
+                row['Ref_물량비(%)'] = 0.0
 
-        for rej_group in top3_rej_groups:
-            group_data = filtered_gap[filtered_gap['REJ_GROUP'] == rej_group]
-            if group_data.empty:
-                continue
-            # GAP 기준 상위 3개
-            top3_in_group = group_data.nlargest(3, '물량비_불량GAP')
-            top3_per_group_list.append(top3_in_group)
+            # GAP 계산
+            row['전체_불량률_GAP(%)'] = (row['Daily_전체_불량률(%)'] - row['Ref_전체_불량률(%)']).round(2)
+            row['물량비_GAP(%)'] = (row['Daily_물량비(%)'] - row['Ref_물량비(%)']).round(2)
 
-        # 6. 병합
-        if not top3_per_group_list:
-            print("각 그룹별 상위 3개 추출 실패")
-            return pd.DataFrame()
+            #  제품 Mix비 변동 계산
+            row['제품 Mix비 변동'] = (
+                (row['Ref_전체_불량률(%)'] - overall_ref_loss_rate) * row['물량비_GAP(%)'] / 100.0
+            ).round(4)
 
-        final_result = pd.concat(top3_per_group_list, ignore_index=True)
+            gap_list.append(row)
 
-        # 7. 정렬: REJ_GROUP → 전체_불량률_영향성 내림차순
-        final_result = final_result.sort_values(
-            ['REJ_GROUP', '물량비_불량GAP'],
-            ascending=[True, False]
-        ).reset_index(drop=True)
+        #전체 제품의 제품 Mix비 변동 합계 계산
+        total_volume_defect_change = sum(item['제품 Mix비 변동'] for item in gap_list)   
 
-        print(f"최종 출력: 각 REJ_GROUP별 GAP 상위 3개 제품")
-        # print(f"결과 (총 {len(final_result)} 건):\n{final_result}")
+        # 전체 결과 DataFrame 생성
+        result = pd.DataFrame(gap_list)
+        if result.empty or 'PRODUCT_TYPE' not in result.columns:
+            return pd.DataFrame(), {}
 
-        return final_result  
+        # 제품 Mix비 변동 기준 내림차순 정렬 → 상위 3개
+        result = result.sort_values('제품 Mix비 변동', ascending=False).head(3)
+
+        # 전체 평균 통계
+        overall_stats = {
+            'total_ref_qty': total_ref_qty,
+            'total_daily_qty': total_daily_qty,
+            'overall_ref_loss_rate': overall_ref_loss_rate,
+            'overall_daily_loss_rate': overall_daily_loss_rate,
+            'total_ref_loss': total_ref_loss,
+            'total_daily_loss': total_daily_loss,
+            'total_volume_defect_change' : total_volume_defect_change
+        }
+
+        return result.reset_index(drop=True), overall_stats
 
     def generate(self):
         """데일리 리포트 생성"""
@@ -491,29 +348,28 @@ class DailyReportGenerator:
                 else:
                     print(f"{key} 없거나 빈 데이터")
 
-
-            product_influence_ref = self._create_product_influence_ref() #[신규] 제품 영향성 Ref 데이터 생성
-
             # 3010 보고서 생성
             data_3010_details = self._create_3010_wafering_300()
 
-            # 1. DATA_3210_wafering_300 생성 + 저장
+            # 1. DATA_3210_wafering_300 생성 + 저장 (먼저!)
             data_3210_details = self._create_DATA_3210_wafering_300()
             self.data['DATA_3210_wafering_300'] = data_3210_details
-
-            # 2. 제품 영향성 분석
-            product_influence_ref = self._create_product_influence_ref()
-            product_influence_daily = self._create_product_influence_daily()
-
-            self.data['product_influence_ref'] = product_influence_ref
-            self.data['product_influence_daily'] = product_influence_daily
-
-            # 3. GAP 분석 실행 
-            product_influence_gap = self._analyze_product_influence_gap()
 
             # 2. DATA_3210_wafering_300_3months 생성 + 저장 (핵심!)
             data_3210_3months = self._create_DATA_3210_wafering_300_3months()
             self.data['DATA_3210_wafering_300_3months'] = data_3210_3months  
+
+            # STEP 1: 전체 불량 기반 분석 먼저
+            total_loss_ref_df, total_loss_ref_qty = self._create_total_loss_ref()
+            total_loss_daily_df, total_loss_daily_qty = self._create_total_loss_daily()
+
+            self.data['total_loss_ref'] = total_loss_ref_df
+            self.data['total_loss_daily'] = total_loss_daily_df
+            self.data['total_loss_ref_total_qty'] = total_loss_ref_qty
+            self.data['total_loss_daily_total_qty'] = total_loss_daily_qty
+
+            total_loss_gap, overall_stats  = self._analyze_total_loss_gap()
+            self.data['overall_stats'] = overall_stats
 
             data_lot_details = self._create_DATA_LOT_3210_wafering_300()
             data_waf_details = self._create_DATA_WAF_3210_wafering_300()
@@ -530,7 +386,8 @@ class DailyReportGenerator:
                 'DATA_3210_wafering_300_3months': data_3210_3months,
                 'DATA_LOT_3210_wafering_300_details': data_lot_details,
                 'DATA_WAF_3210_wafering_300_details': data_waf_details,
-                'product_influence_gap' : product_influence_gap,
+                'total_loss_gap' : total_loss_gap,
+                'overall_stats': overall_stats,
                 'raw_data': self.data
             }
             
@@ -563,10 +420,15 @@ class DailyReportGenerator:
         # --- 전처리 ---
         df['rate'] = pd.to_numeric(df['rate'], errors='coerce')
         df['item_type'] = df['item_type'].astype(str).str.strip()
+        df['dt_range_raw'] = df['dt_range'].astype(str).str.strip() # dt_range_raw: 문자열 정리
 
-        # dt_range_raw: 문자열 정리
-        df['dt_range_raw'] = df['dt_range'].astype(str).str.strip()
-
+        # grade, yld_type 컬럼 처리
+        if 'grade' not in df.columns:
+            df['grade'] = 'Total'
+        if 'yld_type' not in df.columns:
+            df['yld_type'] = 'RTY'
+        df['grade'] = df['grade'].astype(str).str.strip()
+        df['yld_type'] = df['yld_type'].astype(str).str.strip()
 
         # item_type에 따라 파싱 전략 분기
         def parse_date(row):
@@ -590,28 +452,11 @@ class DailyReportGenerator:
         # month_str 생성
         df['month_str'] = df['dt_range'].dt.strftime('%Y-%m')
         current_month = (datetime.now() - timedelta(days=1)).strftime('%Y-%m')
-
         # ──────────────────────────────────────────────────
-        # 1. 월 목표/실적
-        # ──────────────────────────────────────────────────
-        monthly_plan = df[
-            (df['item_type'] == '월사업계획') &
-            (df['month_str'] == current_month)
-        ].copy()
-        monthly_plan_val = float(monthly_plan['rate'].iloc[0]) if not monthly_plan.empty else 0.0
-
-        monthly_actual = df[
-            (df['item_type'] == '월실적') &
-            (df['month_str'] == current_month)
-        ].copy()
-        monthly_actual_val = float(monthly_actual['rate'].iloc[0]) if not monthly_actual.empty else 0.0
-
-        # ──────────────────────────────────────────────────
-        # 2. 기준일: 어제
+        # 기준일: 어제
         # ──────────────────────────────────────────────────
         target_date = (datetime.now().date() - timedelta(days=1))  # 2026-02-03
         print(f"기준일: {target_date}")
-
         # ──────────────────────────────────────────────────
         # 3. 재사용 함수 정의
         # ──────────────────────────────────────────────────
@@ -638,26 +483,52 @@ class DailyReportGenerator:
             
             return None
 
-        # ──────────────────────────────────────────────────
-        # 4. 일 실적: 어제 기준 → 없으면 최신
-        # ──────────────────────────────────────────────────
-        daily_actual_row = get_latest_or_target(df, '일실적', target_date)
-        if daily_actual_row is not None:
-            daily_actual_val = float(daily_actual_row['rate'])
-            daily_actual_date = daily_actual_row['dt_range'].strftime('%Y-%m-%d')
-        else:
-            daily_actual_val = 0.0
-            daily_actual_date = "N/A"
+        # 월 데이터 추출 함수
+        def get_monthly_value(df, item_type, current_month):
+            monthly = df[
+                (df['item_type'] == item_type) &
+                (df['month_str'] == current_month)
+            ]
+            return float(monthly['rate'].iloc[0]) if not monthly.empty else 0.0
 
         # ──────────────────────────────────────────────────
-        # 5. 일 목표: 어제 기준 → 없으면 최신
+        # 4개 조합 (Total/Prime × RTY/OAY) 데이터 추출
         # ──────────────────────────────────────────────────
-        daily_plan_row = get_latest_or_target(df, '일사업계획', target_date)
-        if daily_plan_row is not None:
-            daily_plan_val = float(daily_plan_row['rate'])
-            daily_plan_date = daily_plan_row['dt_range'].strftime('%Y-%m-%d')
-        else:
-            daily_plan_val = 0.0
+        grades = ['Total', 'Prime']
+        yld_types = ['RTY', 'OAY']
+        results = {}
+        daily_actual_date = "N/A"
+
+        for grade in grades:
+            for yld_type in yld_types:
+                key = f"{grade}_{yld_type}"
+                df_filtered = df[(df['grade'] == grade) & (df['yld_type'] == yld_type)].copy()
+                
+                # 월 목표/실적
+                monthly_plan_val = get_monthly_value(df_filtered, '월사업계획', current_month)
+                monthly_actual_val = get_monthly_value(df_filtered, '월실적', current_month)
+                
+                # 일 목표/실적
+                daily_plan_row = get_latest_or_target(df_filtered, '일사업계획', target_date)
+                daily_actual_row = get_latest_or_target(df_filtered, '일실적', target_date)
+                
+                daily_plan_val = float(daily_plan_row['rate']) if daily_plan_row is not None else 0.0
+                if daily_actual_row is not None:
+                    daily_actual_val = float(daily_actual_row['rate'])
+                    daily_actual_date = daily_actual_row['dt_range'].strftime('%Y-%m-%d')
+                else:
+                    daily_actual_val = 0.0
+                
+                results[key] = {
+                    'grade': grade,
+                    'yld_type': yld_type,
+                    'monthly_plan': float(monthly_plan_val),
+                    'monthly_actual': float(monthly_actual_val),
+                    'daily_plan': float(daily_plan_val),
+                    'daily_actual': float(daily_actual_val),
+                    'monthly_gap': float(monthly_actual_val - monthly_plan_val),
+                    'daily_gap': float(daily_actual_val - daily_plan_val)
+                }
 
         # ──────────────────────────────────────────────────
         # 4. 그래프 생성
@@ -675,133 +546,113 @@ class DailyReportGenerator:
             chart_path.unlink() #파일 삭제
             print(f"기존 그래프 파일 삭제됨 : {chart_path}")
 
-        fig, ax = plt.subplots(figsize=(12, 6))
-        # X축 레이블: [월, 일] → 각각 2개의 카테고리 (WF RTY, WF OAY)
-        # 현재는 WF RTY만 사용 중이므로, WF RTY만 표시
-        categories = ['WF RTY']
-        x_labels = ['월', '일']
-        x = np.arange(len(x_labels))  # 월, 일 위치
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4), dpi=300)
+        axes = axes.flatten()
 
-        # 막대 너비
-        bar_width = 0.32
+        plot_order = ['Total_RTY', 'Prime_RTY', 'Total_OAY', 'Prime_OAY']
+        titles = ['Total RTY', 'Prime RTY', 'Total OAY', 'Prime OAY']
 
-        # 목표/실적 값
-        monthly_values = [monthly_plan_val, monthly_actual_val]
-        daily_values = [daily_plan_val, daily_actual_val]
+        for idx, key in enumerate(plot_order):
+            ax = axes[idx]
+            data = results[key]
 
-        # 색상
-        goal_color = 'steelblue'   # 목표
-        actual_color = 'orange'     # 실적
+            # X축: 월, 일
+            x_labels = ['월', '일']
+            x = np.arange(len(x_labels))
+            bar_width = 0.9
+            month_color = '#0000ff'  # 파랑
+            day_color = '#ff0000'    # 빨강
 
-        # 월 그룹
-        bar1 = ax.bar(x[0] - bar_width/2, monthly_values[0], bar_width, label='목표', color=goal_color)
-        bar2 = ax.bar(x[0] + bar_width/2, monthly_values[1], bar_width, label='실적', color=actual_color)
+            # 월/일 각각 하나의 막대 (실적만), 목표는 점선
+            bar_month = ax.bar(x[0], data['monthly_actual'], bar_width, color=month_color)
+            bar_day = ax.bar(x[1], data['daily_actual'], bar_width, color=day_color)
 
-        # 일 그룹
-        bar3 = ax.bar(x[1] - bar_width/2, daily_values[0], bar_width, color=goal_color)
-        bar4 = ax.bar(x[1] + bar_width/2, daily_values[1], bar_width, color=actual_color)
+            # 목표선 (공통 목표 = 일사업계획)
+            ax.axhline(y=data['daily_plan'], color='black', linestyle='--', linewidth=1.2, label='목표')
 
-        # X축 레이블 설정
-        ax.set_xticks(x)
-        ax.set_xticklabels(x_labels, fontsize=12, fontweight='bold')
-        ax.set_xlabel('기간', fontsize=12)
+            # X축 레이블 설정
+            ax.set_xticks(x)
+            ax.set_xticklabels(x_labels, fontsize=15, fontweight='bold')
+            ax.set_xlabel('기간', fontsize=15)
 
-        # Y축 범위
-        all_vals = monthly_values + daily_values
-        min_ylim = min(88.0, min(all_vals) - 0.3)
-        max_ylim = max(98.0, max(all_vals) + 0.3)
+            # Y축 범위
+            all_vals = [data['monthly_actual'], data['daily_actual'], data['daily_plan']]
+            min_ylim = min(all_vals)
+            max_ylim = max(all_vals)
+            ax.set_ylim(max(90, min_ylim - 1.0), max_ylim + 3.0)
+            ylim_bottom = ax.get_ylim()[0]
 
-        ax.set_ylim(min_ylim, max_ylim)        
-        ax.set_ybound(min_ylim, max_ylim)      
+            # 제목
+            ax.set_title(titles[idx], fontsize=20, fontweight='bold', pad=14)
+            ax.set_ylabel('수율 (%)', fontsize=15)
 
-        # 제목
-        ax.set_title(f'WF RTY 수율 비교 (월/일 목표 vs 실적) - 기준일: {daily_actual_date}', fontsize=14, fontweight='bold')
-        ax.set_ylabel('수율 (%)', fontsize=12)
-        ax.set_xlabel('기간', fontsize=12)
+            # 막대 내부에 텍스트
+            def add_internal_label(bar, value):
+                for rect in bar:
+                    height = rect.get_height()
+                    pos = (ylim_bottom + height) / 2.0
+                    ax.text(rect.get_x() + rect.get_width()/2., pos,
+                            f'{value:.2f}%', ha='center', va='center',
+                            fontsize=15, fontweight='bold', color='white')
 
-        # 범례 (목표, 실적)
-        ax.legend(loc='upper right', fontsize=10)
+            add_internal_label(bar_month, data['monthly_actual'])
+            add_internal_label(bar_day, data['daily_actual'])
 
-        # ──────────────────────────────────────────────────
-        # 값 표시: 막대 바로 위
-        # ──────────────────────────────────────────────────
-        def autolabel(rects, values, color='black', fontsize=10):
-            for i, rect in enumerate(rects):
-                height = rect.get_height()
-                ax.text(
-                    rect.get_x() + rect.get_width() / 2.,  # 막대 중앙
-                    height + 0.08,                         # 막대 바로 위 (약간 높이)
-                    f'{values[i]:.2f}%',                   # 값 표시
-                    ha='center', va='bottom',               # 수평 중앙, 수직 아래
-                    fontsize=fontsize, fontweight='bold', color=color
-                )
+            # Gap 라벨 (막대 위, 색상 구분)
+            def add_gap_label(x_pos, gap, base_height):
+                color = 'blue' if gap >= 0 else 'red'
+                sign = '+' if gap >= 0 else ''
+                ax.text(x_pos, base_height + 0.3,
+                        f'{sign}{gap:.2f}%', ha='center', va='bottom',
+                        fontsize=15, fontweight='bold', color=color)
 
-        autolabel([bar1[0]], [monthly_values[0]], 'black', fontsize=10)
-        autolabel([bar2[0]], [monthly_values[1]], 'black', fontsize=10)
-        autolabel([bar3[0]], [daily_values[0]], 'black', fontsize=10)
-        autolabel([bar4[0]], [daily_values[1]], 'black', fontsize=10)
+            add_gap_label(x[0], data['monthly_gap'], data['monthly_actual'])
+            add_gap_label(x[1], data['daily_gap'], data['daily_actual'])
 
-        # ──────────────────────────────────────────────────
-        # Gap 표시: 막대 중간에 수직 정렬
-        # ──────────────────────────────────────────────────
-        monthly_gap = monthly_actual_val - monthly_plan_val
-        daily_gap = daily_actual_val - daily_plan_val
+            # 범례 (상단 왼쪽)
+            ax.legend(loc='upper center', ncol=1, frameon=False, fontsize=15, bbox_to_anchor=(0.5, 0.98))
 
-        gap_x = [x[0], x[1]]
-        gap_y = [(monthly_plan_val + monthly_actual_val) / 2, (daily_plan_val + daily_actual_val) / 2]
+            # 그리드
+            ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
+            ax.set_axisbelow(True)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
 
-        monthly_gap_color = 'orange' if monthly_gap < 0 else 'steelblue'
-        daily_gap_color = 'orange' if daily_gap < 0 else 'steelblue'
-
-        ax.text(
-            gap_x[0], gap_y[0],
-            f'{monthly_gap:+.2f}%',
-            ha='center', va='bottom',  # 수평/수직 중앙
-            fontsize=11, fontweight='bold', color=monthly_gap_color,
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='gray', alpha=0.9)
-        )
-        ax.text(
-            gap_x[1], gap_y[1],
-            f'{daily_gap:+.2f}%',
-            ha='center', va='bottom',  # 수평/수직 중앙
-            fontsize=11, fontweight='bold', color=daily_gap_color,
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='gray', alpha=0.9)
-        )
-
-        # 그리드
-        ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
-
-        # 여백 조정
-        plt.tight_layout()
-        plt.savefig(chart_path, dpi=300, bbox_inches='tight')
+        plt.tight_layout(pad=1.0)
+        plt.savefig(chart_path, dpi=300, bbox_inches='tight', pad_inches=0.5)
         plt.close()
 
         # Base64 인코딩
         with open(chart_path, "rb") as img_file:
             img_base64 = base64.b64encode(img_file.read()).decode()
-
         # ──────────────────────────────────────────────────
-        # 5. 표 생성 (DataFrame)
+        # 5. 표 생성 (계층형 DataFrame)
         # ──────────────────────────────────────────────────
-        table_data = {
-            '항목': ['WF RTY'],
-            '월 목표': [monthly_plan_val],
-            '월 실적': [monthly_actual_val],
-            '일 목표': [daily_plan_val],
-            '일 실적': [daily_actual_val],
-            'Gap(월)': [monthly_plan_val - monthly_actual_val],
-            'Gap(일)': [daily_plan_val - daily_actual_val],
-            '기준일': [daily_actual_date]
-        }
-        table_df = pd.DataFrame(table_data)
+        table_rows = []
+        for yld_type in ['RTY', 'OAY']:
+            for grade in ['Total', 'Prime']:
+                key = f"{grade}_{yld_type}"
+                data = results[key]
+                table_rows.append({
+                    'yld_type': yld_type,
+                    'grade': grade,
+                    'monthly_plan': data['monthly_plan'],
+                    'monthly_actual': data['monthly_actual'],
+                    'monthly_gap': data['monthly_gap'],
+                    'daily_plan': data['daily_plan'],
+                    'daily_actual': data['daily_actual'],
+                    'daily_gap': data['daily_gap']
+                })
 
-        # details 업데이트
+        table_df = pd.DataFrame(table_rows)
+
         details.update({
             'chart_path': str(chart_path),
             'img_base64': img_base64,
             'table_df': table_df,
             'summary': table_df,
-            'daily_actual_date': daily_actual_date  # Excel에 표시용
+            'daily_actual_date': daily_actual_date,
+            'results': results
         })
 
         return details
@@ -809,7 +660,7 @@ class DailyReportGenerator:
     def _create_DATA_3210_wafering_300(self):
         """3210 불량률 상세 분석 """
         details = {}
-        
+
         if 'DATA_3210_wafering_300' not in self.data or self.data['DATA_3210_wafering_300'].empty:
             print("DATA_3210_wafering_300 데이터 없음 또는 비어 있음")
             return details
@@ -860,21 +711,24 @@ class DailyReportGenerator:
         plt.figure(figsize=(10, 6))
         x = np.arange(len(summary))
         bars = plt.bar(x, summary['GAP_PCT'],
-                    color=summary['GAP_PCT'].apply(lambda x: 'orange' if x > 0 else 'steelblue'), linewidth=1)
+                    color=summary['GAP_PCT'].apply(lambda x: '#ff0000' if x > 0 else '#0000ff'), linewidth=1)
 
         plt.title(f"Gap 분석 - {base_date}", fontsize=14, fontweight='bold')
-        plt.xlabel('REJ_GROUP', fontsize=12)
-        plt.ylabel('GAP (%)', fontsize=12)
-        plt.xticks(x, summary['REJ_GROUP'], rotation=45, ha='right')
+        plt.xlabel('REJ_GROUP', fontsize=14)
+        plt.ylabel('GAP (%)', fontsize=14)
+        plt.xticks(x, summary['REJ_GROUP'], rotation=90, ha='right')
 
         for i, bar in enumerate(bars):
             height = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width() / 2, height + 0.01 * (1 if height >= 0 else -1),
-                    f"{height:.2f}%", ha='center', va='bottom' if height >= 0 else 'top',
-                    fontsize=9, fontweight='bold')
+            # 라벨 위치 조정 (양수는 위, 음수는 아래)
+            offset = 0.01 * (1 if height >= 0 else -1)
+            va_pos = 'bottom' if height >= 0 else 'top'
+            plt.text(bar.get_x() + bar.get_width() / 2, height + offset,
+                    f"{height:.2f}%", ha='center', va=va_pos,
+                    fontsize=14, fontweight='bold', color='black')
 
-        plt.ylim(min(-0.15, summary['GAP_PCT'].min() - 0.05), max(1.3, summary['GAP_PCT'].max() + 0.05))
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.ylim(-0.5, 0.5) #-0.5 ~ 0.5로 변경 요청
+        plt.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
         plt.tight_layout()
         plt.savefig(chart_path, dpi=300, bbox_inches='tight')
         plt.close()
@@ -900,7 +754,7 @@ class DailyReportGenerator:
 
             # MID_GROUP별 평균 LOSS_RATIO 계산
             mid_agg = group_df.groupby('MID_GROUP', dropna=False).agg(
-                YESTERDAY_LOSS_RATIO=('LOSS_RATIO', 'mean')
+                YESTERDAY_LOSS_RATIO=('LOSS_RATIO', 'sum') #mean -> sum으로 변경
             ).reset_index()
 
             mid_agg['REJ_GROUP'] = rej_group
@@ -910,19 +764,123 @@ class DailyReportGenerator:
         # 전체 yesterday MID_GROUP 실적
         yesterday_mid_summary = pd.concat(yesterday_mid_list, ignore_index=True) if yesterday_mid_list else pd.DataFrame()
 
-
         # ──────────────────────────────────────────────────
-        # 3. 세부분석: 상위 3개 REJ_GROUP에 해당하는 함수만 실행
+        #  5. details에 top3 + yesterday_mid_summary 저장
         # ──────────────────────────────────────────────────
-        detailed_analysis = []
+        details.update({
+            'summary': summary,
+            'top3_rej_groups': top3_rej_groups,
+            'yesterday_mid_summary': yesterday_mid_summary,  # 핵심: MID_GROUP 실적 저장
+            'chart_path': str(chart_path),
+            'img_base64': img_base64
+            # 'detailed_analysis': detailed_analysis_dict #딕셔너리 저장
+        })
 
-        if not top3_rej_groups:
-            detailed_analysis.append("[세부분석] 상위 3개 불량 그룹 없음")
-        else:
-            df_wafer = self.data.get('DATA_WAF_3210_wafering_300')
-            df_lot = self.data.get('DATA_LOT_3210_wafering_300')
+        self.top3_rej_groups = top3_rej_groups
 
-            # REJ_GROUP → 분석 함수 매핑
+        return details
+
+
+    def _create_DATA_3210_wafering_300_3months(self):
+        """3210 불량률 상세 분석(3개월) """
+
+        details = {}
+        
+        try:
+            if 'DATA_3210_wafering_300_3months' not in self.data or self.data['DATA_3210_wafering_300_3months'].empty:
+                print("DATA_3210_wafering_300_3months 데이터 없음 또는 비어 있음")
+                return details
+
+            df = self.data['DATA_3210_wafering_300_3months'].copy()
+
+            # 컬럼 타입 변환
+            numeric_cols = ['LOSS_QTY', 'MGR_QTY']
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # 2. 분모 계산: BASE_DT_NM 기준 MGR_QTY 중복 제거 후 전체 합계
+            #    (동일 일자의 MGR_QTY 는 동일하므로, 일자별 고유 값의 합 = 기간 총 투입량)
+            mgr_qty_daily = df[['BASE_DT_NM', 'MGR_QTY']].drop_duplicates(subset=['BASE_DT_NM', 'MGR_QTY'])
+            total_mgr_qty = mgr_qty_daily['MGR_QTY'].sum()
+
+
+            if total_mgr_qty == 0:
+                print("기간 내 MGR_QTY 합계가 0 입니다.")
+                return details
+
+
+            # 3. 분자 계산: AFT_BAD_RSN_CD 별 LOSS_QTY 전체 합계
+            summary_list = []
+            for rej_group, group_df in df.groupby('REJ_GROUP', dropna=False):
+                # 해당 REJ_GROUP의 매핑 가져오기
+                mid_mapping = REJ_GROUP_TO_MID_MAPPING.get(rej_group, {})
+                
+                # AFT_BAD_RSN_CD 기준으로 MID_GROUP 생성
+                group_df = group_df.copy()
+                group_df['MID_GROUP'] = group_df['AFT_BAD_RSN_CD'].map(mid_mapping)
+                
+                #  매핑되지 않은 경우: 원래 AFT_BAD_RSN_CD 값 유지
+                group_df['MID_GROUP'] = group_df['MID_GROUP'].fillna(group_df['AFT_BAD_RSN_CD'])
+
+                # 그룹 집계: REJ_GROUP + MID_GROUP + AFT_BAD_RSN_CD
+                agg_df = group_df.groupby(['REJ_GROUP', 'MID_GROUP', 'AFT_BAD_RSN_CD'], dropna=False).agg(
+                    TOTAL_LOSS_QTY=('LOSS_QTY', 'sum'),
+                    COUNT_DAYS=('BASE_DT_NM', 'nunique')
+                ).reset_index()
+
+                # 4. LOSS_RATIO 계산: 분자 (TOTAL_LOSS_QTY) / 분모 (total_mgr_qty)
+                agg_df['AVG_LOSS_RATIO'] = agg_df['TOTAL_LOSS_QTY'] / total_mgr_qty
+                agg_df['LOSS_RATIO_PCT'] = (agg_df['AVG_LOSS_RATIO'] * 100).round(2)
+
+                # 참조용: 분모 정보 저장 (검증용)
+                agg_df['TOTAL_MGR_QTY'] = total_mgr_qty
+
+                summary_list.append(agg_df)
+
+            # 전체 요약 병합
+            summary_3months = pd.concat(summary_list, ignore_index=True)
+            summary_3months['LOSS_RATIO_PCT'] = (summary_3months['AVG_LOSS_RATIO'] * 100).round(2)
+
+            # yesterday_mid_summary 가져오기
+            yesterday_mid = self.data.get('DATA_3210_wafering_300', {}).get('yesterday_mid_summary', pd.DataFrame())
+
+            if yesterday_mid.empty:
+                details['summary'] = summary_3months
+                return details
+
+            # 상위 3개 REJ_GROUP 가져오기 (Gap 기준)
+            top3_rej_groups = self.data.get('DATA_3210_wafering_300', {}).get('top3_rej_groups', [])
+
+            # 3개월 평균 (Ref) 준비
+            ref_3months = summary_3months[summary_3months['REJ_GROUP'].isin(yesterday_mid['REJ_GROUP'])].copy()
+            # REJ_GROUP + MID_GROUP 기준 집계 (AFT_BAD_RSN_CD 는 제거하고 MID_GROUP 수준으로 비교)
+            ref_3months = ref_3months.groupby(['REJ_GROUP', 'MID_GROUP'], dropna=False).agg(
+                REF_AVG_LOSS_RATIO=('AVG_LOSS_RATIO', 'sum'),  # 동일 MID_GROUP 내 불량코드 합계 비율
+                REF_LOSS_QTY=('TOTAL_LOSS_QTY', 'sum')
+            ).reset_index()
+
+
+            # 병합 → Gap 계산 (전체 사용)
+            merged = pd.merge(
+                yesterday_mid,
+                ref_3months,
+                on=['REJ_GROUP', 'MID_GROUP'],
+                how='inner'
+            )
+            merged['GAP'] = merged['YESTERDAY_LOSS_PCT'] - (merged['REF_AVG_LOSS_RATIO'] * 100)
+            merged['Gap'] = merged['GAP'].round(2)
+            merged['실적(%)'] = merged['YESTERDAY_LOSS_PCT']
+            merged['Ref(3개월)'] = (merged['REF_AVG_LOSS_RATIO'] * 100).round(2)
+            merged['범례'] = merged['MID_GROUP']
+
+            # 모든 분석 통합 시작
+            top_rej_mid_groups = []
+            group_tables = {}
+            analysis_text = "[ Prime 주요 열위 불량 세부코드 분석 Ref.(3개월) 比 일 실적 변동 (상위 3개) ]\n"
+            detailed_analysis_dict = {}  # 세부분석 결과 저장
+
+            # REJ_GROUP별 분석 함수 매핑 (내부 정의)
             REJ_GROUP_TO_ANALYZER = {
                 'FLATNESS': analyze_flatness,
                 'WARP&BOW': analyze_warp,
@@ -938,27 +896,48 @@ class DailyReportGenerator:
                 'NOSALE': analyze_NOSALE,
                 'OTHER': analyze_OTHER,
                 'GR_보증': analyze_GR,
-                'SAMPLE' : analyze_sample,
+                'SAMPLE': analyze_sample,
                 'PARTICLE': analyze_particle
             }
+            # 데이터 준비
+            df_wafer = self.data.get('DATA_WAF_3210_wafering_300')
+            df_lot = self.data.get('DATA_LOT_3210_wafering_300')
 
             for rej in top3_rej_groups:
                 rej = rej.strip()
+                group_df = merged[merged['REJ_GROUP'] == rej].copy()
+                if group_df.empty:
+                    continue
+
+                # 1. top_rej_mid_groups 생성 (그래프 기준)
+                top3 = group_df.nlargest(3, 'Gap')
+                top_rej_mid_groups.extend([(rej, mid) for mid in top3['MID_GROUP']])
+
+                # 2. 표 생성
+                table = top3[['MID_GROUP', 'YESTERDAY_LOSS_PCT', 'REF_AVG_LOSS_RATIO', 'Gap']].copy()
+                table.rename(columns={
+                    'YESTERDAY_LOSS_PCT': '실적(%)',
+                    'REF_AVG_LOSS_RATIO': 'Ref(3개월)'
+                }, inplace=True)
+                table['Ref(3개월)'] *= 100
+                table['Ref(3개월)'] = table['Ref(3개월)'].round(2)
+                group_tables[rej] = table
+
+                # 3. 분석 텍스트
+                top_row = top3.iloc[0]
+                analysis_text += f"\n {rej} 최대 Gap: {top_row['MID_GROUP']} ({top_row['Gap']:.2f}%)"
+
+                # 4. 세부분석 함수 실행
                 if rej not in REJ_GROUP_TO_ANALYZER:
-                    detailed_analysis.append(f"[{rej} 분석] 매핑된 분석 함수 없음")
+                    detailed_analysis_dict[rej] = [f"[{rej} 분석] 함수 없음"]
                     continue
 
                 analyzer_func = REJ_GROUP_TO_ANALYZER[rej]
-
-                # 함수 시그니처 기반 자동 인자 바인딩
                 sig = signature(analyzer_func)
-                params = sig.parameters
-
-                # 정밀 인자 준비
                 bound_args = {}
                 missing = []
 
-                for param_name, param in params.items():
+                for param_name, param in sig.parameters.items():
                     if 'wafer' in param_name.lower():
                         if df_wafer is not None:
                             df_target = df_wafer[df_wafer['REJ_GROUP'] == rej].copy()
@@ -970,203 +949,46 @@ class DailyReportGenerator:
                             bound_args[param_name] = df_lot
                         else:
                             missing.append(param_name)
-                    else:
-                        # 기본값 있으면 건너뜀
-                        if param.default != param.empty:
-                            continue
-                        else:
-                            missing.append(param_name)
+                    elif param.name == 'target_mids':
+                        bound_args['target_mids'] = [mid for mid in top3['MID_GROUP']]
+                        print(f"{rej}: target_mids → {bound_args['target_mids']}")
+                    elif param.default == param.empty:
+                        missing.append(param_name)
 
                 if missing:
-                    error_msg = f"[{rej} 분석] 필수 인자 누락: {missing}"
-                    detailed_analysis.append(error_msg)
+                    detailed_analysis_dict[rej] = [f"[{rej} 분석] 누락: {missing}"]
                     continue
 
                 try:
                     result = analyzer_func(**bound_args)
-                    detailed_analysis.extend(result)
+                    content_only = result[1:] if len(result) > 1 and result[0].startswith("[") else result
+                    detailed_analysis_dict[rej] = content_only
                 except Exception as e:
-                    error_msg = f"[{rej} 분석] 실행 오류: {e}"
-                    detailed_analysis.append(error_msg)
-
-                # detailed_analysis.extend(result)
-
-        # ──────────────────────────────────────────────────
-        #  5. details에 top3 + yesterday_mid_summary 저장
-        # ──────────────────────────────────────────────────
-        details.update({
-            'summary': summary,
-            'top3_rej_groups': top3_rej_groups,
-            'yesterday_mid_summary': yesterday_mid_summary,  # 핵심: MID_GROUP 실적 저장
-            'chart_path': str(chart_path),
-            'img_base64': img_base64,
-            'detailed_analysis': detailed_analysis
-        })
-
-        self.top3_rej_groups = top3_rej_groups
+                    detailed_analysis_dict[rej] = [f"[{rej} 분석] 오류: {e}"]
 
 
-        return details
+            # 개별 플롯 생성
+            plot_paths = self._create_top3_midgroup_plot_per_group(merged, top3_rej_groups)
 
+            # 최종 details 업데이트
+            details.update({
+                'summary': summary_3months,
+                'top_rej_mid_groups': top_rej_mid_groups,
+                'top3_midgroup_analysis': {
+                    'tables': group_tables,
+                    'plot_paths': plot_paths,
+                    'analysis': analysis_text.strip(),
+                    'detailed_analysis': detailed_analysis_dict  #  세부분석 포함
+                }
+            })
 
-    def _create_DATA_3210_wafering_300_3months(self):
-        """3210 불량률 상세 분석(3개월) """
-
-        details = {}
+            return details
         
-        if 'DATA_3210_wafering_300_3months' not in self.data or self.data['DATA_3210_wafering_300_3months'].empty:
-            print("DATA_3210_wafering_300_3months 데이터 없음 또는 비어 있음")
-            return details
-
-        df = self.data['DATA_3210_wafering_300_3months'].copy()
-        print(f"✅ [DEBUG 0] 원본 데이터 행 수: {len(df)}")
-        print(f"✅ [DEBUG 0] 원본 데이터 컬럼: {df.columns.tolist()}")
-
-        # 컬럼 타입 변환
-        numeric_cols = ['LOSS_QTY', 'MGR_QTY']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # 2. 분모 계산: BASE_DT_NM 기준 MGR_QTY 중복 제거 후 전체 합계
-        #    (동일 일자의 MGR_QTY 는 동일하므로, 일자별 고유 값의 합 = 기간 총 투입량)
-        mgr_qty_daily = df[['BASE_DT_NM', 'MGR_QTY']].drop_duplicates(subset=['BASE_DT_NM', 'MGR_QTY'])
-        total_mgr_qty = mgr_qty_daily['MGR_QTY'].sum()
-        print(f"✅ [DEBUG 1] 일자별 MGR_QTY 행 수: {len(mgr_qty_daily)}, 총 투입량: {total_mgr_qty:,.0f}")
-
-
-        if total_mgr_qty == 0:
-            print("기간 내 MGR_QTY 합계가 0 입니다.")
-            return details
-
-        print(f"✅ [DEBUG 2] REJ_GROUP 종류: {df['REJ_GROUP'].unique()}")
-        print(f"✅ [DEBUG 2] AFT_BAD_RSN_CD 샘플: {df['AFT_BAD_RSN_CD'].unique()[:5]}")
-
-
-        # 3. 분자 계산: AFT_BAD_RSN_CD 별 LOSS_QTY 전체 합계
-        summary_list = []
-        for rej_group, group_df in df.groupby('REJ_GROUP', dropna=False):
-            # 해당 REJ_GROUP의 매핑 가져오기
-            mid_mapping = REJ_GROUP_TO_MID_MAPPING.get(rej_group, {})
-            
-            # AFT_BAD_RSN_CD 기준으로 MID_GROUP 생성
-            group_df = group_df.copy()
-            group_df['MID_GROUP'] = group_df['AFT_BAD_RSN_CD'].map(mid_mapping)
-            
-            #  매핑되지 않은 경우: 원래 AFT_BAD_RSN_CD 값 유지
-            group_df['MID_GROUP'] = group_df['MID_GROUP'].fillna(group_df['AFT_BAD_RSN_CD'])
-
-            # [DEBUG 3] MID_GROUP 생성 후 null 확인
-            null_count = group_df['MID_GROUP'].isnull().sum()
-            if null_count > 0:
-                print(f"⚠️ [DEBUG 3] {rej_group} 에서 MID_GROUP null {null_count}개 발생")
-            # [DEBUG 3] MID_GROUP 생성 후 null 확인
-
-            # 그룹 집계: REJ_GROUP + MID_GROUP + AFT_BAD_RSN_CD
-            agg_df = group_df.groupby(['REJ_GROUP', 'MID_GROUP', 'AFT_BAD_RSN_CD'], dropna=False).agg(
-                TOTAL_LOSS_QTY=('LOSS_QTY', 'sum'),
-                COUNT_DAYS=('BASE_DT_NM', 'nunique')
-            ).reset_index()
-
-            # [DEBUG 4] 집계 후 LOSS_QTY 합계 확인
-            group_loss_sum = agg_df['TOTAL_LOSS_QTY'].sum()
-            print(f"✅ [DEBUG 4] {rej_group} 집계된 총 불량량: {group_loss_sum:,.0f}")
-            # [DEBUG 4] 집계 후 LOSS_QTY 합계 확인
-
-            # 4. LOSS_RATIO 계산: 분자 (TOTAL_LOSS_QTY) / 분모 (total_mgr_qty)
-            agg_df['AVG_LOSS_RATIO'] = agg_df['TOTAL_LOSS_QTY'] / total_mgr_qty
-            agg_df['LOSS_RATIO_PCT'] = (agg_df['AVG_LOSS_RATIO'] * 100).round(2)
-
-            # 참조용: 분모 정보 저장 (검증용)
-            agg_df['TOTAL_MGR_QTY'] = total_mgr_qty
-
-            summary_list.append(agg_df)
-
-        # 전체 요약 병합
-        summary_3months = pd.concat(summary_list, ignore_index=True)
-        summary_3months['LOSS_RATIO_PCT'] = (summary_3months['AVG_LOSS_RATIO'] * 100).round(2)
-
-
-        # [DEBUG 5] summary_3months 최종 확인
-        print(f"✅ [DEBUG 5] summary_3months 행 수: {len(summary_3months)}")
-        print(f"✅ [DEBUG 5] summary_3months MID_GROUP 종류: {summary_3months['MID_GROUP'].unique()}")
-        print(f"✅ [DEBUG 5] summary_3months AVG_LOSS_RATIO 합계: {summary_3months['AVG_LOSS_RATIO'].sum():.6f}")
-        print(f"✅ [DEBUG 5] summary_3months 샘플:\n{summary_3months[['REJ_GROUP', 'MID_GROUP', 'TOTAL_LOSS_QTY', 'AVG_LOSS_RATIO']].head(10)}")
-
-
-    # yesterday_mid_summary 가져오기
-        yesterday_mid = self.data.get('DATA_3210_wafering_300', {}).get('yesterday_mid_summary', pd.DataFrame())
-        if yesterday_mid.empty:
-            details['summary'] = summary_3months
-            return details
-
-        print(f"✅ [DEBUG 6] yesterday_mid 행 수: {len(yesterday_mid)}")
-        print(f"✅ [DEBUG 6] yesterday_mid MID_GROUP 종류: {yesterday_mid['MID_GROUP'].unique()}")
-
-        # 상위 3개 REJ_GROUP 가져오기 (Gap 기준)
-        top3_rej_groups = self.data.get('DATA_3210_wafering_300', {}).get('top3_rej_groups', [])
-        print(f"✅ [DEBUG 7] top3_rej_groups: {top3_rej_groups}")
-
-        # 3개월 평균 (Ref) 준비
-        ref_3months = summary_3months[summary_3months['REJ_GROUP'].isin(yesterday_mid['REJ_GROUP'])].copy()
-        print(f"✅ [DEBUG 8] ref_3months 필터링 후 행 수: {len(ref_3months)}")
-        # REJ_GROUP + MID_GROUP 기준 집계 (AFT_BAD_RSN_CD 는 제거하고 MID_GROUP 수준으로 비교)
-        ref_3months = ref_3months.groupby(['REJ_GROUP', 'MID_GROUP'], dropna=False).agg(
-            REF_AVG_LOSS_RATIO=('AVG_LOSS_RATIO', 'sum'),  # 동일 MID_GROUP 내 불량코드 합계 비율
-            REF_LOSS_QTY=('TOTAL_LOSS_QTY', 'sum')
-        ).reset_index()
-
-        print(f"✅ [DEBUG 9] ref_3months 집계 후 행 수: {len(ref_3months)}")
-        print(f"✅ [DEBUG 9] ref_3months 샘플:\n{ref_3months[['REJ_GROUP', 'MID_GROUP', 'REF_AVG_LOSS_RATIO', 'REF_LOSS_QTY']].head(10)}")
-        print(f"yesterday_mid:", yesterday_mid.head(5))
-
-        # 병합 → Gap 계산 (전체 사용)
-        merged = pd.merge(
-            yesterday_mid,
-            ref_3months,
-            on=['REJ_GROUP', 'MID_GROUP'],
-            how='inner'
-        )
-        print(f"✅ [DEBUG 10] merged 행 수: {len(merged)} (어제: {len(yesterday_mid)}, 3 개월: {len(ref_3months)})")
-
-        merged['GAP'] = merged['YESTERDAY_LOSS_PCT'] - (merged['REF_AVG_LOSS_RATIO'] * 100)
-        merged['Gap'] = merged['GAP'].round(2)
-        merged['실적(%)'] = merged['YESTERDAY_LOSS_PCT']
-        merged['Ref(3개월)'] = (merged['REF_AVG_LOSS_RATIO'] * 100).round(2)
-        merged['범례'] = merged['MID_GROUP']
-
-        # [DEBUG 11] 최종 Ref(3 개월) 값 확인
-        print(f"✅ [DEBUG 11] merged Ref(3개월) 평균: {merged['Ref(3개월)'].mean():.2f}%")
-        print(f"✅ [DEBUG 11] merged Ref(3개월) 0 인 행: {(merged['Ref(3개월)'] == 0).sum()}개")
-
-        # 개별 플롯 생성
-        plot_paths = self._create_top3_midgroup_plot_per_group(merged, top3_rej_groups)
-
-        # 각 그룹별 표도 상위 3개만
-        group_tables = {}
-        analysis_text = "[ Prime 주요 열위 불량 세부코드 분석 Ref.(3개월) 比 일 실적 변동 (상위 3개) ]\n"
-        for rej in top3_rej_groups:
-            df_group = merged[merged['REJ_GROUP'] == rej].copy()
-            if df_group.empty:
-                continue
-            top3 = df_group.nlargest(3, 'Gap')[['MID_GROUP', '실적(%)', 'Ref(3개월)', 'Gap']].copy()
-            group_tables[rej] = top3
-
-            if len(top3) > 0:
-                top_row = top3.iloc[0]
-                analysis_text += f"\n {rej} 최대 Gap: {top_row['MID_GROUP']} ({top_row['Gap']:.2f}%)"
-
-        # 최종 details 업데이트
-        details.update({
-            'summary': summary_3months,
-            'top3_midgroup_analysis': {
-                'tables': group_tables,
-                'plot_paths': plot_paths,
-                'analysis': analysis_text.strip()
-            }
-        })
-
-        return details
+        except Exception as e:
+            print(f"\n❌ [ERROR] _create_DATA_3210_wafering_300_3months 중 오류 발생: {e}")
+            import traceback
+            traceback.print_exc()
+            return details  # 빈 상태로 반환
 
     def _create_top3_midgroup_plot_per_group(self, merged_df, top3_rej_groups):
         """
@@ -1200,36 +1022,99 @@ class DailyReportGenerator:
                 # 기존 파일 삭제
                 if plot_path.exists():
                     plot_path.unlink()
+                # 서브플롯 생성 (가로 3개)
+                fig, axes = plt.subplots(1, 3, figsize=(15, 4), dpi=300)
+                if len(top3_mids) == 1:
+                    axes = [axes]
+                elif len(top3_mids) < 3:
+                    # 빈 서브플롯 숨기기
+                    for i in range(len(top3_mids), 3):
+                        axes[i].set_visible(False)
 
-                plt.figure(figsize=(8, 5))
-                x = np.arange(len(top3_mids))
-                bars = plt.bar(x, top3_mids['Gap'],
-                            color=top3_mids['Gap'].apply(lambda x: 'orange' if x > 0 else 'steelblue'), linewidth=1)
+                # 전체 Y축 범위 계산 (3개 MID 기준 통합)
+                all_values = []
+                for _, row in top3_mids.iterrows():
+                    all_values.extend([float(row['Ref(3개월)']), float(row['실적(%)'])])
+                
+                global_min = min(all_values) if all_values else 0
+                global_max = max(all_values) if all_values else 0
 
-                # # Gap > 0인 경우 빨간 테두리 강조
-                # for i, bar in enumerate(bars):
-                #     if top3_mids['Gap'].iloc[i] > 0:
-                #         bar.set_edgecolor('red')
-                #         bar.set_linewidth(2)
+                # 여유 포함 (0 반드시 포함)
+                y_min = min(0, float(global_min) * 0.95)
+                y_max = max(float(global_max) * 1.15, 0.01)
 
-                plt.title(f"[ {rej_group} 상위 3개 MID_GROUP Gap 분석 ]", fontsize=12, fontweight='bold')
-                plt.xlabel('MID_GROUP', fontsize=11)
-                plt.ylabel('Gap (%)', fontsize=11)
-                plt.xticks(x, top3_mids['MID_GROUP'], rotation=0, ha='center')  #  여기서 rotation=0 → 수평
+                # 각 MID_GROUP 그래프 그리기 (동일 Y축)
+                for i, (idx, row) in enumerate(top3_mids.iterrows()):
+                    ax = axes[i]
+                    mid_name = row['MID_GROUP']
+                    ref_val = float(row['Ref(3개월)'])
+                    actual_val = float(row['실적(%)'])
+                    gap_val = actual_val - ref_val
 
-                # 값 표시
-                for i, bar in enumerate(bars):
-                    height = bar.get_height()
-                    plt.text(bar.get_x() + bar.get_width() / 2, height + 0.01 * (1 if height >= 0 else -1),
-                            f"{height:.2f}%", ha='center', va='bottom' if height >= 0 else 'top',
-                            fontsize=12, fontweight='bold')
+                    # X 축 위치
+                    x_center = 0
+                    bar_width = 0.9
+                    ref_x = x_center - bar_width/2
+                    daily_x = x_center + bar_width/2
 
-                # y축 범위
-                plt.ylim(min(-0.15, top3_mids['Gap'].min() - 0.05), max(1.3, top3_mids['Gap'].max() + 0.05))
-                plt.grid(axis='y', linestyle='--', alpha=0.7)
+                    # 막대 그리기
+                    bar_ref = ax.bar(ref_x, ref_val, bar_width, color='#0000ff')
+                    bar_actual = ax.bar(daily_x, actual_val, bar_width, color='#ff0000')
+
+                    #  Y 축 범위 (0 반드시 포함)
+                    ax.set_ylim(y_min, y_max)
+                    ax.set_title(f"[{mid_name}]", fontsize=14, fontweight='bold', pad=15)
+
+                    # X 축 라벨
+                    ax.set_xticks([ref_x, daily_x])
+                    ax.set_xticklabels(['Ref.', '일'], fontsize=14, fontweight='bold')
+
+                    #  내부 라벨 (흰색, 막대 중앙)
+                    label_offset = 0.01
+                    for bar, val in zip([bar_ref, bar_actual], [ref_val, actual_val]):
+                        height = bar[0].get_height()
+                        # 양수면 위, 음수면 아래
+                        if height >= 0:
+                            va = 'bottom'
+                            label_y = height + label_offset
+                        else:
+                            va = 'top'
+                            label_y = height - label_offset
+
+                        ax.text(bar[0].get_x() + bar[0].get_width()/2., label_y,
+                                f'{val:.2f}%', 
+                                ha='center', va=va,                    # 가로 중앙, 세로 정렬 (bottom/top)
+                                fontsize=15, fontweight='bold', 
+                                color='black',                         
+                                zorder=4)                              # 막대 위에 표시
+
+                    #  Gap 라벨 (제목과 겹치지 않게)
+                    max_val = max(ref_val, actual_val)
+                    min_val = min(ref_val, actual_val)
+                    
+                    # 양수면 막대 위, 음수면 막대 아래
+                    if max_val >= 0:
+                        gap_y = max_val * 1.1  
+                        va_align = 'bottom'
+                    else:
+                        gap_y = min_val * 1.1
+                        va_align = 'top'
+                    
+                    gap_x = x_center
+                    gap_color = '#ff0000' if gap_val >= 0 else '#0000ff'
+                    ax.text(gap_x, gap_y, f'{gap_val:+.2f}%', ha='center', va=va_align,
+                            fontsize=15, fontweight='bold', color=gap_color)
+
+                    # 그리드
+                    ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
+                    ax.set_axisbelow(True)
+                    ax.spines['top'].set_visible(False)
+                    ax.spines['right'].set_visible(False)
+
+                # 전체 제목
+                fig.suptitle(f"[ {rej_group} 상위 3개 분석 ]", fontsize=14, fontweight='bold', y=1.02)
+
                 plt.tight_layout()
-
-                # 저장
                 plt.savefig(str(plot_path), dpi=300, bbox_inches='tight')
                 plt.close()
 
@@ -1411,7 +1296,6 @@ class DailyReportGenerator:
                     '일%': f"{daily_rate:+.2f}%",
                     'Gap': f"{gap:+.2f}%"
                 })
-
                 #  원시 데이터 저장
                 ref_qty_dict[cret_cd] = int(ref_qty)
                 daily_qty_dict[cret_cd] = int(daily_qty)
@@ -1419,7 +1303,6 @@ class DailyReportGenerator:
             #  모수 저장
             ref_qty_dict['모수'] = int(avg_in_qty) #3개월 평균 분모 -> ref 분모
             daily_qty_dict['모수'] = int(total_daily_qty) #일 분모
-
 
             report_table_total.append({
                 '구분': '모수',
@@ -1444,6 +1327,8 @@ class DailyReportGenerator:
             rej_groups = ['PARTICLE', 'FLATNESS', 'WARP&BOW', 'NANO']
             details['rc_hg_ref_qty_by_group'] = {}
             details['rc_hg_daily_qty_by_group'] = {}
+            details['rc_hg_ref_rate_by_group'] = {}    
+            details['rc_hg_daily_rate_by_group'] = {}  
             details['rc_hg_gap_data_by_group'] = {}
             details['loss_rate_table_by_group'] = {}
             details['rc_hg_gap_chart_path_by_group'] = {}
@@ -1462,6 +1347,8 @@ class DailyReportGenerator:
                 gap_data = {}
                 ref_qty_dict_group = {}
                 daily_qty_dict_group = {}
+                ref_rate_dict_group = {}     
+                daily_rate_dict_group = {}   
 
                 for cret_cd in cret_list:
                     ref_qty = group_loss_by_cret.get(cret_cd, 0)
@@ -1483,6 +1370,9 @@ class DailyReportGenerator:
                     gap_data[cret_cd] = gap
                     ref_qty_dict_group[cret_cd] = int(ref_qty)
                     daily_qty_dict_group[cret_cd] = int(daily_qty)
+                    ref_rate_dict_group[cret_cd] = ref_rate      
+                    daily_rate_dict_group[cret_cd] = daily_rate 
+
 
                 # 기존 방식과 동일하게 DataFrame으로 저장
                 group_table_df = pd.DataFrame(group_table)
@@ -1493,52 +1383,117 @@ class DailyReportGenerator:
                 #  저장
                 details['rc_hg_ref_qty_by_group'][group] = ref_qty_dict_group
                 details['rc_hg_daily_qty_by_group'][group] = daily_qty_dict_group
+                details['rc_hg_ref_rate_by_group'][group] = ref_rate_dict_group      
+                details['rc_hg_daily_rate_by_group'][group] = daily_rate_dict_group 
                 details['rc_hg_gap_data_by_group'][group] = gap_data  # 그래프용
 
-                fig, ax = plt.subplots(figsize=(8, 4))
+                fig, axes = plt.subplots(1, 3, figsize=(10, 6), dpi=300)
+                categories = ['FS', 'RESC', 'HG']
 
-                categories = ['FS', 'HG', 'RESC']
-                values = [float(gap_data.get(c, 0.0)) for c in categories]
+                # 각 공정별 Y축 범위를 고정
+                Y_LIM_MAP = {
+                    'FS': (4.0, 12.0),   # FS: 4% \~ 12%
+                    'RESC': (-3.0, 1.0), # RESC: -3% \~ 1%
+                    'HG': (-3.0, 1.0)    # HG: -3% \~ 1%
+                }
 
-                # 색상 설정: 양수=주황, 음수=파랑, 0=회색
-                
-                colors = ['orange' if v > 0 else 'steelblue' if v < 0 else 'gray' for v in values]
+                # 색상
+                ref_color = '#0000ff'   # 쨍한 파랑
+                daily_color = '#ff0000' # 쨍한 빨강
 
-                # bar (수직 막대)
-                bars = ax.bar(categories, values, color=colors, width=0.6)
+                for idx, cret_cd in enumerate(categories):
+                    ax = axes[idx]
+                    
+                    # 데이터 추출
+                    ref_rate = float(details['rc_hg_ref_rate_by_group'][group].get(cret_cd, 0.0))
+                    daily_rate = float(details['rc_hg_daily_rate_by_group'][group].get(cret_cd, 0.0))
+                    gap = float(details['rc_hg_gap_data_by_group'][group].get(cret_cd, 0.0))
 
-                # 제목 및 라벨
-                ax.set_title(f'RC/HG 보상({group})', fontsize=12, fontweight='bold')
-                ax.set_ylabel('Gap (%)', fontsize=10)  # Y축이 Gap
-                ax.set_xlabel('구분', fontsize=10)     # X축이 구분
+                    # Y축 범위 기반 동적 오프셋 계산
+                    y_min, y_max = Y_LIM_MAP[cret_cd]
+                    y_range = y_max - y_min
+                    
+                    label_offset = y_range * 0.025  # 막대 값 라벨: 전체 높이의 2.5%
+                    gap_offset   = y_range * 0.06   # Gap 라벨: 전체 높이의 6% (더 멀리 배치)
 
-                min_ylim = min(0, min(values) - 0.3)
-                max_ylim = max(0, max(values) + 0.3)
+                    # 막대 그리기
+                    x_center = 0
+                    bar_width = 0.9
+                    ref_x = x_center - bar_width/2
+                    daily_x = x_center + bar_width/2
 
-                ax.set_ylim(min_ylim, max_ylim)        
-                ax.set_ybound(min_ylim, max_ylim)      
+                    bar_ref = ax.bar(ref_x, ref_rate, bar_width, color=ref_color)
+                    bar_daily = ax.bar(daily_x, daily_rate, bar_width, color=daily_color)
+                    
+                    # 통일된 Y축 범위 적용
+                    y_min, y_max = Y_LIM_MAP[cret_cd]
+                    ax.set_ylim(y_min, y_max)
+                                        
+                    # ✅ 막대 값 라벨 함수: 양수/음수 동일한 거리로
+                    def add_internal_label(bar, value):
+                        for rect in bar:
+                            height = rect.get_height()
+                            if height >= 0:
+                                pos_y = float(height + label_offset)
+                                va = 'bottom'
+                            else:
+                                pos_y = float(height - label_offset)
+                                va = 'top'
+                            ax.text(
+                                rect.get_x() + rect.get_width() / 2.,
+                                pos_y,
+                                f'{value:.2f}%',
+                                ha='center', va=va,
+                                fontsize=15, fontweight='bold',
+                                color='black',
+                                zorder=4
+                            )
+                    
+                    add_internal_label(bar_ref, ref_rate)
+                    add_internal_label(bar_daily, daily_rate)
 
-                ax.grid(True, axis='y', linestyle='--', alpha=0.7)  # Y축 기준 그리드
+                    max_height = max(ref_rate, daily_rate)
+                    min_height = min(ref_rate, daily_rate)
 
-                # 막대 위에 값 표시
-                for bar, val in zip(bars, values):
-                    height = bar.get_height()
-                    if height >= 0:
-                        y_pos = height + 0.005
-                        va = 'bottom'
+                    # ✅ Gap 라벨: Gap 부호에 따라 위치 결정
+                    if gap >= 0:
+                        gap_y = float(max_height + gap_offset)
+                        va_align = 'bottom'
                     else:
-                        y_pos = height - 0.005
-                        va = 'top'
-                    ax.text(bar.get_x() + bar.get_width() / 2, y_pos, f"{val:+.2f}%", ha='center', va=va, fontsize=9, fontweight='bold', color='black')
+                        gap_y = float(min_height - gap_offset)
+                        va_align = 'top'
 
-                plt.tight_layout()
+                    gap_color = '#ff0000' if gap >= 0 else '#0000ff'
+                    sign = '+' if gap >= 0 else ''
+                    ax.text(x_center, gap_y, f'{sign}{gap:.2f}%', ha='center', va=va_align,
+                            fontsize=15, fontweight='bold', color=gap_color)
+
+                    # X 축
+                    ax.set_xticks([ref_x, daily_x])
+                    ax.set_xticklabels(['Ref.', '일'], fontsize=20, fontweight='bold')
+                    
+                    # 제목
+                    ax.set_title(cret_cd, fontsize=20, fontweight='bold', pad=10)
+                    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.1f}%'))
+                    ax.tick_params(axis='y', labelsize=14)
+                    #  그리드 및 축 설정 유지
+                    ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
+                    ax.set_axisbelow(True)
+                    ax.spines['top'].set_visible(False)
+                    ax.spines['right'].set_visible(False)
+
+                # 전체 제목
+                fig.suptitle(f'RC/HG 보상 ({group})', fontsize=14, fontweight='bold', y=1.05)
+                
+                # 여백 최적화
+                plt.tight_layout(pad=0.8)
 
                 graph_path = debug_dir / f"RC_HG_보상_{group}.png"
                 if graph_path.exists():
                     graph_path.unlink()
                     print(f"기존 그래프 파일 삭제됨: {graph_path}")
 
-                plt.savefig(graph_path, dpi=150, bbox_inches='tight')
+                plt.savefig(graph_path, dpi=300, bbox_inches='tight')
                 plt.close()
 
                 details['rc_hg_gap_chart_path_by_group'][group] = str(graph_path)
@@ -1547,51 +1502,132 @@ class DailyReportGenerator:
             #  7. 전체 RC/HG 보상 그래프 생성
             # ===================================================================
             total_gap_data = {}
+            total_ref_data = {}
+            total_daily_data = {}
+
             for row in report_table_total:
                 if row['구분'] in ['FS', 'HG', 'RESC']:
                     gap_str = row['Gap'].replace('%', '').replace('+', '')
                     total_gap_data[row['구분']] = float(gap_str)
+                    ref_str = row['Ref.(3개월)%'].replace('%', '').replace('+', '')
+                    daily_str = row['일%'].replace('%', '').replace('+', '')
+                    total_ref_data[row['구분']] = float(ref_str)
+                    total_daily_data[row['구분']] = float(daily_str)
 
-            categories = ['FS', 'HG', 'RESC']
-            values = [total_gap_data.get(c, 0.0) for c in categories]
+            fig, axes = plt.subplots(1, 3, figsize=(10, 6), dpi=300)
+            categories = ['FS', 'RESC', 'HG']
+            # ──────────────────────────────────────────────────
+            # 전체 데이터 기준 Y축 범위 계산
+            # ──────────────────────────────────────────────────
+            all_vals = []
+            for cret_cd in categories:
+                ref_rate = total_ref_data.get(cret_cd, 0)
+                daily_rate = total_daily_data.get(cret_cd, 0)
+                all_vals.extend([ref_rate, daily_rate, 0])
 
-            colors = ['orange' if total_gap_data.get(c, 0) > 0 else 
-                    'steelblue' if total_gap_data.get(c, 0) < 0 else 'gray' for c in categories]
+            # 색상
+            ref_color = '#0000ff'   # 쨍한 파랑
+            daily_color = '#ff0000' # 쨍한 빨강
 
-            fig, ax = plt.subplots(figsize=(8, 4))
-            bars = ax.bar(categories, values, color=colors,  width=0.6)
+            # 각 공정별 Y축 범위 정의 (고정)
+            Y_LIM_MAP = {
+                'FS': (4.0, 12.0),   # 4% \~ 12%
+                'RESC': (-3.0, 1.0), # -3% \~ 1%
+                'HG': (-3.0, 1.0)    # -3% \~ 1%
+            }
 
-            ax.set_title('RC/HG 보상(Ref.비 수준)', fontsize=12, fontweight='bold')
-            ax.set_ylabel('Gap (%)', fontsize=10)
-            ax.set_xlabel('구분', fontsize=10)
-            
-            min_ylim = min(0, min(values) - 0.3)
-            max_ylim = max(0, max(values) + 0.3)
+            for idx, cret_cd in enumerate(categories):
+                ax = axes[idx]
+                
+                # 데이터 추출
+                ref_rate = float(total_ref_data.get(cret_cd, 0))
+                daily_rate = float(total_daily_data.get(cret_cd, 0))
+                gap = float(total_gap_data.get(cret_cd, 0.0))
+                                
+                # Gap 라벨 위치 조정 (음수/양수 대응)
+                y_min, y_max = Y_LIM_MAP[cret_cd]
+                y_range = y_max - y_min
+                
+                label_offset = y_range * 0.02   # 막대 값 라벨: 막대 끝에서의 거리 (예: 0.15%p)
+                gap_offset = y_range * 0.07   # Gap 라벨: 기준점에서의 거리 (예: 0.30%p)
 
-            ax.set_ylim(min_ylim, max_ylim)        
-            ax.set_ybound(min_ylim, max_ylim)    
+                # 막대 그리기
+                x_center = 0
+                bar_width = 0.9
+                ref_x = x_center - bar_width/2
+                daily_x = x_center + bar_width/2
 
-            ax.grid(True, axis='y', linestyle='--', alpha=0.7)
+                bar_ref = ax.bar(ref_x, ref_rate, bar_width, color=ref_color)
+                bar_daily = ax.bar(daily_x, daily_rate, bar_width, color=daily_color)
+                
+                def add_internal_label(bar, value):
+                    for rect in bar:
+                        height = rect.get_height()
+                        if height >= 0:
+                            pos_y = float(height + label_offset)
+                            va = 'bottom'
+                        else:
+                            pos_y = float(height - label_offset)
+                            va = 'top'
+                        ax.text(
+                            rect.get_x() + rect.get_width() / 2.,
+                            pos_y,
+                            f'{value:.2f}%',
+                            ha='center', va=va,
+                            fontsize=15, fontweight='bold',
+                            color='black',
+                            zorder=4
+                        )
+                
+                add_internal_label(bar_ref, ref_rate)
+                add_internal_label(bar_daily, daily_rate)
 
-            for bar, val in zip(bars, values):
-                height = bar.get_height()
-                if height >= 0:
-                    y_pos = height + 0.005
-                    va = 'bottom'
+                # ✅ Gap 라벨: Gap 부호에 따라 위치 결정
+                if gap >= 0:
+                    # Gap 양수 → max_height 기준 위에
+                    gap_y = max(ref_rate, daily_rate) + gap_offset
+                    va_align = 'bottom'
                 else:
-                    y_pos = height - 0.005
-                    va = 'top'
-                ax.text(bar.get_x() + bar.get_width() / 2,  y_pos, f"{val:+.2f}%",  ha='center',  va=va, fontsize=9,  fontweight='bold', color='black')
+                    # Gap 음수 → min_height 기준 아래에
+                    gap_y = min(ref_rate, daily_rate) - gap_offset
+                    va_align = 'top'
+ 
+                gap_color = '#0000ff' if gap >= 0 else '#ff0000'   # '#0000ff'   # 쨍한 파랑 ,'#ff0000' # 쨍한 빨강
+                sign = '+' if gap >= 0 else ''
+                ax.text(x_center, gap_y, f'{sign}{gap:.2f}%', ha='center', va=va_align,
+                        fontsize=15, fontweight='bold', color=gap_color)
 
-            plt.tight_layout()
+                # X 축
+                ax.set_xticks([ref_x, daily_x])
+                ax.set_xticklabels(['Ref.', '일'], fontsize=20, fontweight='bold')
+                
+                # 제목
+                ax.set_title(cret_cd, fontsize=20, fontweight='bold', pad=10)
+                y_min, y_max = Y_LIM_MAP[cret_cd] # Y축 범위 고정
+                ax.set_ylim(y_min, y_max)
+                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.1f}%'))
+                ax.tick_params(axis='y', labelsize=14)
+                # 그리드
+                ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
+                ax.set_axisbelow(True)
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                
+            # 전체 제목
+            fig.suptitle(f'RC/HG 보상 ({group})', fontsize=14, fontweight='bold', y=1.05)
+            
+            # 여백 최적화
+            plt.tight_layout(pad=0.8)
+            
+            # 저장
             total_graph_path = debug_dir / "RC_HG_보상_전체.png"
             if total_graph_path.exists():
                 total_graph_path.unlink()
                 print(f"기존 전체 그래프 파일 삭제됨: {total_graph_path}")
-
-            plt.savefig(total_graph_path, dpi=150, bbox_inches='tight')
+            
+            plt.savefig(total_graph_path, dpi=300, bbox_inches=None, pad_inches=0)
             plt.close()
-
+            
             details['rc_hg_gap_chart_path_total'] = str(total_graph_path)
 
             # ===================================================================
@@ -1644,8 +1680,6 @@ class DailyReportGenerator:
             for i in range(70)  # 월별 파일용
         }
 
-        print(f"[WAF 혼합 로드] 대상 기간: {(base_date - timedelta(days=69)).strftime('%Y%m%d')} \\~ {base_date.strftime('%Y%m%d')}")
-
         # ===================================================================
         # [2] 월별 파일 로드 (예: DATA_WAF_3210_wafering_300_202601.parquet)
         # ===================================================================
@@ -1670,19 +1704,14 @@ class DailyReportGenerator:
             except Exception as e:
                 print(f"[월별 파일 파싱 실패] {file_path.name}: {e}")
 
-        print(f"[월별 파일] {len(valid_monthly_files)}개 발견: {[ym for _, ym in valid_monthly_files]}")
-
         dfs_monthly = []
         for file_path, ym in valid_monthly_files:
             try:
                 df = pd.read_parquet(file_path)
-                print(f"[월별 로드] {file_path.name} → {len(df):,} 건")
-
                 # BASE_DT가 있는 경우, 해당 월 데이터만 필터링
                 if 'BASE_DT' in df.columns:
                     df['BASE_DT'] = df['BASE_DT'].astype(str)
                     df = df[df['BASE_DT'].str.startswith(ym)].copy()
-                    print(f"[필터링] {ym} → {len(df):,} 건")
 
                 dfs_monthly.append(df)
             except Exception as e:
@@ -1697,13 +1726,10 @@ class DailyReportGenerator:
             if file_path.exists():
                 daily_files.append(file_path)
 
-        print(f"[일별 파일] {len(daily_files)}개 발견")
-
         dfs_daily = []
         for file_path in daily_files:
             try:
                 df = pd.read_parquet(file_path)
-                print(f"[일별 로드] {file_path.name} → {len(df):,} 건")
                 dfs_daily.append(df)
             except Exception as e:
                 print(f"[일별 로드 실패] {file_path.name}: {e}")
@@ -1717,10 +1743,7 @@ class DailyReportGenerator:
             return pd.DataFrame()
 
         df_combined = pd.concat(all_dfs, ignore_index=True)
-        print(f"[WAF 혼합 로드 완료] 총 {len(df_combined):,} 건 병합")
-
         df_fs = df_combined[df_combined['CRET_CD'] == 'FS'].copy() # CRET_CD가 FS인 데이터만 사용.
-        print(f"[CRET_CD 필터링] 원본 {len(df_combined):,} 건 → 'FS' 데이터: {len(df_fs):,} 건")
 
         df_combined = df_fs
 
@@ -1898,7 +1921,7 @@ class DailyReportGenerator:
             eqp_col = ['EQP_NM_300_WF_3670']
             pit_daily = {}
             for eqp in eqp_col:
-                res = calculate_loss_metrics(df_pit, eqp, avg_in_qty)
+                res = calculate_loss_metrics(df_pit_d, eqp, avg_in_qty)
                 if res:
                     pit_daily[eqp] = res
             daily_results['PIT'] = pit_daily
@@ -1906,7 +1929,7 @@ class DailyReportGenerator:
         # 2) SCRATCH
         df_scratch = df_cached_3months[df_cached_3months['REJ_GROUP'] == 'SCRATCH']
         if not df_scratch.empty:
-            eqps_scratch = ['EQP_NM_300_WF_3670', 'EQP_NM_300_WF_6100']
+            eqps_scratch = ['EQP_NM_300_WF_3670', 'EQP_NM_300_WF_6100', 'EQP_NM_300_WF_7000'] #3670(LAP), 6100(DSP), 7000(EBIS)
             scratch_ref  = {}
             for eqp in eqps_scratch:
                 res = calculate_loss_metrics(df_scratch, eqp, avg_in_qty)
@@ -1916,7 +1939,7 @@ class DailyReportGenerator:
 
         df_scratch_d = df_self_data[df_self_data['REJ_GROUP'] == 'SCRATCH']
         if not df_scratch_d.empty:
-            eqps_scratch = ['EQP_NM_300_WF_3670', 'EQP_NM_300_WF_6100']
+            eqps_scratch = ['EQP_NM_300_WF_3670', 'EQP_NM_300_WF_6100', 'EQP_NM_300_WF_7000']
             scratch_daily = {}
             for eqp in eqps_scratch:
                 res = calculate_loss_metrics(df_scratch_d, eqp, total_daily_qty)
@@ -1948,83 +1971,280 @@ class DailyReportGenerator:
 
 
         # 4) BROKEN
+        # AFT_BAD_RSN_CD → MID_GROUP 매핑
+        BROKEN_MID_MAPPING = REJ_GROUP_TO_MID_MAPPING.get('BROKEN', {})
+
+        # 결과 저장
+        ref_results['BROKEN'] = {}
+        daily_results['BROKEN'] = {}
+
+
+        # 중간 결과 저장 (전체 비교용)
+        broken_ref_list = []
+        broken_daily_list = []
+
+        # df_broken 필터링
         df_broken = df_cached_3months[df_cached_3months['REJ_GROUP'] == 'BROKEN']
-        if not df_broken.empty:
-            eqps = ['EQP_NM_300_WF_3670', 'EQP_NM_300_WF_6100', 'EQP_NM_300_WF_6500']
-            broken_ref = {}
-            for eqp in eqps:
-                res = calculate_loss_metrics(df_broken, eqp, avg_in_qty)
-                if res:
-                    broken_ref[eqp] = res
-            ref_results['BROKEN'] = broken_ref
-
         df_broken_d = df_self_data[df_self_data['REJ_GROUP'] == 'BROKEN']
-        if not df_broken_d.empty:
-            eqps = ['EQP_NM_300_WF_3670', 'EQP_NM_300_WF_6100', 'EQP_NM_300_WF_6500']
-            broken_daily = {}
-            for eqp in eqps:
-                res = calculate_loss_metrics(df_broken_d, eqp, total_daily_qty)
-                if res:
-                    broken_daily[eqp] = res
-            daily_results['BROKEN'] = broken_daily
 
+        # ===================================================================
+        # [1] REF 데이터 처리 (각 MID_GROUP 내 장비별 상위 3개)
+        # ===================================================================
+        if not df_broken.empty:
+            # MID_GROUP 생성
+            df_broken['MID_GROUP'] = df_broken['AFT_BAD_RSN_CD'].map(BROKEN_MID_MAPPING)
+            df_broken = df_broken.dropna(subset=['MID_GROUP'])
+            df_broken['MID_GROUP'] = df_broken['MID_GROUP'].astype(str).str.strip().str.upper()
+            df_broken = df_broken.reset_index(drop=True)  # 중복 인덱스 방지
+
+            for mid_group, group_df in df_broken.groupby('MID_GROUP'):
+                if mid_group not in MID_TO_EQP:
+                    continue
+
+                eqp_col = MID_TO_EQP[mid_group]
+
+                if eqp_col not in group_df.columns:
+                    # 컬럼 없으면 전체 LOSS_QTY 합산 (비상)
+                    loss_qty = pd.to_numeric(group_df['LOSS_QTY'], errors='coerce').sum()
+                    total_rate = (loss_qty / avg_in_qty * 100)
+                    broken_ref_list.append({
+                        'EQP': f"{mid_group}_UNKNOWN",
+                        'count': float(loss_qty),
+                        'in_qty': avg_in_qty,
+                        'rate': round(total_rate, 4),
+                        'MID_GROUP': mid_group,
+                        'AFT_BAD_RSN_CD': f"{mid_group}_ALL"
+                    })
+                else:
+                    # 장비별 분해
+                    res_dict = calculate_loss_metrics(group_df, eqp_col, avg_in_qty)
+                    if not res_dict:
+                        continue
+
+                    for eqp_name, metrics in res_dict.items():
+                        if pd.isna(eqp_name) or str(eqp_name).strip() == '':
+                            continue
+                        broken_ref_list.append({
+                            'EQP': eqp_name,
+                            'count': metrics['count'],
+                            'in_qty': avg_in_qty,
+                            'rate': metrics['rate'],
+                            'MID_GROUP': mid_group,
+                            'AFT_BAD_RSN_CD': f"{mid_group}_{eqp_name}"
+                        })
+
+        # ===================================================================
+        # [2] Daily 데이터 처리 (장비별 상위 3개)
+        # ===================================================================
+        if not df_broken_d.empty:
+            df_broken_d['MID_GROUP'] = df_broken_d['AFT_BAD_RSN_CD'].map(BROKEN_MID_MAPPING)
+            df_broken_d = df_broken_d.dropna(subset=['MID_GROUP'])
+            df_broken_d['MID_GROUP'] = df_broken_d['MID_GROUP'].astype(str).str.strip().str.upper()
+            df_broken_d = df_broken_d.reset_index(drop=True)
+
+            for mid_group, group_df in df_broken_d.groupby('MID_GROUP'):
+                if mid_group not in MID_TO_EQP:
+                    continue
+
+                eqp_col = MID_TO_EQP[mid_group]
+
+                if eqp_col not in group_df.columns:
+                    loss_qty = pd.to_numeric(group_df['LOSS_QTY'], errors='coerce').sum()
+                    total_rate = (loss_qty / total_daily_qty * 100)
+                    broken_daily_list.append({
+                        'EQP': f"{mid_group}_UNKNOWN",
+                        'count': float(loss_qty),
+                        'in_qty': total_daily_qty,
+                        'rate': round(total_rate, 4),
+                        'MID_GROUP': mid_group,
+                        'AFT_BAD_RSN_CD': f"{mid_group}_ALL"
+                    })
+                else:
+                    res_dict = calculate_loss_metrics(group_df, eqp_col, total_daily_qty)
+                    if not res_dict:
+                        continue
+
+                    for eqp_name, metrics in res_dict.items():
+                        if pd.isna(eqp_name) or str(eqp_name).strip() == '':
+                            continue
+                        broken_daily_list.append({
+                            'EQP': eqp_name,
+                            'count': metrics['count'],
+                            'in_qty': total_daily_qty,
+                            'rate': metrics['rate'],
+                            'MID_GROUP': mid_group,
+                            'AFT_BAD_RSN_CD': f"{mid_group}_{eqp_name}"
+                        })
+
+        # ===================================================================
+        # [4] 상위 3개 장비 선정 + ref_results/daily_results 분리 저장
+        # ===================================================================
+        # 기존 'BROKEN' 제거
+        if 'BROKEN' in ref_results:
+            del ref_results['BROKEN']
+        if 'BROKEN' in daily_results:
+            del daily_results['BROKEN']
+
+        # 분리 저장용 딕셔너리
+        ref_results['LAP_BROKEN'] = {}
+        ref_results['EP_BROKEN'] = {}
+        ref_results['DSP_BROKEN'] = {}
+        ref_results['FP_BROKEN'] = {}
+
+        daily_results['LAP_BROKEN'] = {}
+        daily_results['EP_BROKEN'] = {}
+        daily_results['DSP_BROKEN'] = {}
+        daily_results['FP_BROKEN'] = {}
+
+        # REF: MID_GROUP별 상위 3개 추출
+        if broken_ref_list:
+            df_all = pd.DataFrame(broken_ref_list)
+
+            for mid_group, group_df in df_all.groupby('MID_GROUP'):
+                top3 = group_df.sort_values('rate', ascending=False).head(3)
+                key = f"{mid_group}_BROKEN"
+
+                if key in ref_results:
+                    for _, row in top3.iterrows():
+                        ref_results[key][row['EQP']] = {
+                            'count': row['count'],
+                            'in_qty': row['in_qty'],
+                            'rate': row['rate'],
+                            'MID_GROUP': row['MID_GROUP'],
+                            'AFT_BAD_RSN_CD': row['AFT_BAD_RSN_CD']
+                        }
+ 
+        # Daily: MID_GROUP별 상위 3개 추출
+        if broken_daily_list:
+            df_all_d = pd.DataFrame(broken_daily_list)
+
+            for mid_group, group_df in df_all_d.groupby('MID_GROUP'):
+                top3 = group_df.sort_values('rate', ascending=False).head(3)
+                key = f"{mid_group}_BROKEN"
+
+                if key in daily_results:
+                    for _, row in top3.iterrows():
+                        daily_results[key][row['EQP']] = {
+                            'count': row['count'],
+                            'in_qty': row['in_qty'],
+                            'rate': row['rate'],
+                            'MID_GROUP': row['MID_GROUP'],
+                            'AFT_BAD_RSN_CD': row['AFT_BAD_RSN_CD']
+                        }
 
         # 5) CHIP
         df_chip = df_cached_3months[df_cached_3months['REJ_GROUP'] == 'CHIP']
+
         if not df_chip.empty:
             chip_ref = {}
+            # 조건 정의
             cond_edge = df_chip['AFT_BAD_RSN_CD'] == 'EDGE-CHIP'
             cond_lap = df_chip['AFT_BAD_RSN_CD'] == 'CHIP-LAP'
             cond_eg1af = df_chip['AFT_BAD_RSN_CD'] == 'CHIP_EG1AF'
             cond_eg1bf = df_chip['AFT_BAD_RSN_CD'] == 'CHIP_EG1BF'
+            cond_echip = df_chip['AFT_BAD_RSN_CD'] == 'E_CHIP'  # 추가
 
-            if not df_chip[cond_edge].empty:
-                for eqp in ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']:
-                    res = calculate_loss_metrics(df_chip[cond_edge], eqp, avg_in_qty)
-                    if res:
-                        chip_ref[f'EDGE-CHIP_{eqp}'] = res
-            if not df_chip[cond_lap].empty:
-                res = calculate_loss_metrics(df_chip[cond_lap], 'EQP_NM_300_WF_3670', avg_in_qty)
-                if res:
-                    chip_ref['CHIP-LAP_EQP_NM_300_WF_3670'] = res
-            if not df_chip[cond_eg1af].empty:
-                for eqp in ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']:
-                    res = calculate_loss_metrics(df_chip[cond_eg1af], eqp, avg_in_qty)
-                    if res:
-                        chip_ref[f'CHIP_EG1AF_{eqp}'] = res
-            if not df_chip[cond_eg1bf].empty:
-                res = calculate_loss_metrics(df_chip[cond_eg1bf], 'EQP_NM_300_WF_3300', avg_in_qty)
-                if res:
-                    chip_ref['CHIP_EG1BF_EQP_NM_300_WF_3300'] = res
-            ref_results['CHIP'] = chip_ref
+            # 그룹별 처리 (그룹명, 조건, 장비 리스트)
+            groups = [
+                ('EDGE-CHIP', cond_edge, ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']),
+                ('CHIP-LAP', cond_lap, ['EQP_NM_300_WF_3670']),
+                ('CHIP_EG1AF', cond_eg1af, ['EQP_NM_300_WF_3335']),  # 수정: 리스트로 통일
+                ('CHIP_EG1BF', cond_eg1bf, ['EQP_NM_300_WF_3300']),
+                ('EDGE-ECHIP', cond_echip, ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696', 'EQP_NM_300_WF_7000'])  # 추가
+            ]
+
+            for group_name, condition, eqp_list in groups:
+                group_df = df_chip[condition]
+                if group_df.empty:
+                    continue
+
+                # 그룹 초기화
+                if group_name not in ref_results:
+                    ref_results[group_name] = {}
+
+                has_data = False  # 데이터 유무 플래그
+
+                for eqp in eqp_list:
+                    res = calculate_loss_metrics(group_df, eqp, avg_in_qty)
+                    if not res:
+                        continue
+                
+                    key = f'{group_name}_{eqp}'
+                    chip_ref[key] = res
+
+                    # BROKEN 방식과 동일하게 ref_results[group][equip_id] 저장
+                    for equip_id, metrics in res.items():
+                        if pd.isna(equip_id) or str(equip_id).strip() == '':
+                            continue
+                        ref_results[group_name][equip_id] = {
+                            'count': metrics['count'],
+                            'in_qty': avg_in_qty,
+                            'rate': metrics['rate'],
+                            'MID_GROUP': group_name,
+                            'AFT_BAD_RSN_CD': f"{group_name}_{equip_id}"
+                        }
+                        has_data = True  # 데이터 있음 표시
+                # 데이터가 없으면 ref_results에서 제거
+                if not has_data:
+                    ref_results.pop(group_name, None)
+
+            # 전체 CHIP 저장 (옵션)
+            if chip_ref:
+                ref_results['CHIP'] = chip_ref
 
         df_chip_d = df_self_data[df_self_data['REJ_GROUP'] == 'CHIP']
+
         if not df_chip_d.empty:
             chip_daily = {}
             cond_edge = df_chip_d['AFT_BAD_RSN_CD'] == 'EDGE-CHIP'
             cond_lap = df_chip_d['AFT_BAD_RSN_CD'] == 'CHIP-LAP'
             cond_eg1af = df_chip_d['AFT_BAD_RSN_CD'] == 'CHIP_EG1AF'
             cond_eg1bf = df_chip_d['AFT_BAD_RSN_CD'] == 'CHIP_EG1BF'
+            cond_echip = df_chip_d['AFT_BAD_RSN_CD'] == 'E_CHIP'
 
-            if not df_chip_d[cond_edge].empty:
-                for eqp in ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']:
-                    res = calculate_loss_metrics(df_chip_d[cond_edge], eqp, total_daily_qty)
-                    if res:
-                        chip_daily[f'EDGE-CHIP_{eqp}'] = res
-            if not df_chip_d[cond_lap].empty:
-                res = calculate_loss_metrics(df_chip_d[cond_lap], 'EQP_NM_300_WF_3670', total_daily_qty)
-                if res:
-                    chip_daily['CHIP-LAP_EQP_NM_300_WF_3670'] = res
-            if not df_chip_d[cond_eg1af].empty:
-                for eqp in ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']:
-                    res = calculate_loss_metrics(df_chip_d[cond_eg1af], eqp, total_daily_qty)
-                    if res:
-                        chip_daily[f'CHIP_EG1AF_{eqp}'] = res
-            if not df_chip_d[cond_eg1bf].empty:
-                res = calculate_loss_metrics(df_chip_d[cond_eg1bf], 'EQP_NM_300_WF_3300', total_daily_qty)
-                if res:
-                    chip_daily['CHIP_EG1BF_EQP_NM_300_WF_3300'] = res
-            daily_results['CHIP'] = chip_daily
+            groups = [
+                ('EDGE-CHIP', cond_edge, ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']),
+                ('CHIP-LAP', cond_lap, ['EQP_NM_300_WF_3670']),
+                ('CHIP_EG1AF', cond_eg1af, ['EQP_NM_300_WF_3335']),
+                ('CHIP_EG1BF', cond_eg1bf, ['EQP_NM_300_WF_3300']),
+                ('EDGE-ECHIP', cond_echip, ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696', 'EQP_NM_300_WF_7000'])
+            ]
+
+            for group_name, condition, eqp_list in groups:
+                group_df = df_chip_d[condition]
+                if group_df.empty:
+                    continue
+
+                if group_name not in daily_results:
+                    daily_results[group_name] = {}
+
+                has_data = False
+                for eqp in eqp_list:
+                    res = calculate_loss_metrics(group_df, eqp, total_daily_qty)
+                    if not res:
+                        continue
+
+                    key = f'{group_name}_{eqp}'
+                    chip_daily[key] = res
+
+                    # daily_results도 동일 구조
+                    for equip_id, metrics in res.items():
+                        if pd.isna(equip_id) or str(equip_id).strip() == '':
+                            continue
+                        daily_results[group_name][equip_id] = {
+                            'count': metrics['count'],
+                            'in_qty': total_daily_qty,
+                            'rate': metrics['rate'],
+                            'MID_GROUP': group_name,
+                            'AFT_BAD_RSN_CD': f"{group_name}_{equip_id}"
+                        }
+                        has_data = True
+
+                if not has_data:
+                    daily_results.pop(group_name, None)
+
+            if chip_daily:
+                daily_results['CHIP'] = chip_daily
 
         # 6) VISUAL
         df_visual = df_cached_3months[df_cached_3months['REJ_GROUP'] == 'VISUAL']
@@ -2059,107 +2279,153 @@ class DailyReportGenerator:
         # ===================================================================
         # 8. Gap 계산 (각 공정별 상위 3개 장비만)
         # ===================================================================
-
         gap_results = {}
+
+        # BROKEN, CHIP 등 분해된 그룹 정의
+        BROKEN_SUBGROUPS = ['LAP_BROKEN', 'EP_BROKEN', 'DSP_BROKEN', 'FP_BROKEN']
+        CHIP_SUBGROUPS = ['EDGE-CHIP', 'CHIP_EG1BF', 'CHIP_EG1AF', 'CHIP-LAP', 'E_CHIP']
 
         def extract_process(eqp_col):
             match = re.search(r'(\d{4})$', eqp_col)
             return match.group(1) if match else eqp_col
 
-        for group, ref_dict in ref_results.items():
-            if group not in daily_results:
+        # ===================================================================
+        # [1] BROKEN: LAP_BROKEN, EP_BROKEN 등 처리
+        # ===================================================================
+        for group in BROKEN_SUBGROUPS:
+            if group not in ref_results:
+                print(f"[WARN] ref_results에 {group} 없음")
                 continue
-            daily_group = daily_results[group]
+            if group not in daily_results:
+                print(f"[WARN] daily_results에 {group} 없음")
+                continue
+
+            # 공정 추출: 'LAP_BROKEN' → 'LAP'
+            proc = group.split('_')[0]
+            eqp_col = MID_TO_EQP.get(proc)
+            if not eqp_col:
+                continue
+
+            ref_dict = ref_results[group]
+            daily_dict = daily_results[group]
+
+            gap_col = {}
+            for eqp, ref_data in ref_dict.items():
+                if not isinstance(ref_data, dict):
+                    continue
+                # ref_rate: % → 소수 변환
+                ref_rate_decimal = ref_data.get('rate', 0.0) / 100.0  # 0.0012 → 0.000012
+
+                # daily_rate: 존재하면 가져오기, 없으면 0
+                daily_rate_decimal = 0.0
+                if eqp in daily_dict:
+                    daily_data = daily_dict[eqp]
+                    if isinstance(daily_data, dict):
+                        daily_rate_decimal = daily_data.get('rate', 0.0) / 100.0  # 0.0163 → 0.000163
+
+                # gap = daily - ref
+                gap = daily_rate_decimal - ref_rate_decimal
+                if ref_data or eqp in daily_dict:  #  데이터 존재 여부 확인
+                    gap_col[eqp] = round(gap, 6)  # 0도 포함
+
+            # 장비별 gap이 있으면 저장
+            if gap_col:
+                gap_results[group] = {eqp_col: gap_col}
+
+        for group in CHIP_SUBGROUPS:
+            if group not in ref_results or group not in daily_results:
+                continue
+
+            ref_dict = ref_results[group] # ex: {'EDGE-CHIP_EQP_NM_300_WF_3335': {'BSEG02': {...}, ...}}
+            daily_dict = daily_results[group]
+            # group에 따라 해당 장비 컬럼 결정 → mapping.py 기반
+            gap_sub = {}
+            # 그룹 → 장비 컬럼 목록 매핑
+            if group in ['CHIP-LAP', 'EDGE-CHIP', 'CHIP_EG1AF']:
+                eqp_cols = ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696']
+            elif group == 'CHIP_EG1BF':
+                eqp_cols = ['EQP_NM_300_WF_3300']
+            elif group == 'E_CHIP':
+                eqp_cols = ['EQP_NM_300_WF_3335', 'EQP_NM_300_WF_3696', 'EQP_NM_300_WF_7000']
+            else:
+                continue
+
+            # 각 장비 컬럼별 gap_col 생성
+            for eqp_col in eqp_cols:
+                gap_col = {}
+
+                # ref_dict는 equip_id 기준 → 바로 순회
+                for equip_id, ref_item in ref_dict.items():
+                    if not isinstance(ref_item, dict):
+                        continue
+
+                    ref_rate = ref_item.get('rate', 0.0) / 100.0
+
+                    daily_rate = 0.0
+                    if equip_id in daily_dict:
+                        daily_item = daily_dict[equip_id]
+                        if isinstance(daily_item, dict):
+                            daily_rate = daily_item.get('rate', 0.0) / 100.0
+
+                    gap = daily_rate - ref_rate
+                    gap_col[equip_id] = round(gap, 6)
+
+                if gap_col:
+                    gap_sub[eqp_col] = gap_col
+
+            if gap_sub:
+                gap_results[group] = gap_sub
+                print(f"[INFO] {group} → gap_results 저장됨: {list(gap_sub.keys())}")
+            else:
+                print(f"[WARN] {group} → gap_sub 비어있음")
+
+        # ===================================================================
+        # [3] 나머지 그룹: SCRATCH, EDGE, PIT, VISUAL 등
+        # ===================================================================
+        SIMPLE_GROUPS = ['SCRATCH', 'EDGE', 'PIT', 'VISUAL']
+
+        for group in SIMPLE_GROUPS:
+            if group not in ref_results or group not in daily_results:
+                continue
+
+            ref_dict = ref_results[group]
+            daily_dict = daily_results[group]
 
             if not isinstance(ref_dict, dict):
                 continue
-            if not isinstance(daily_group, dict):
-                daily_group = {}
 
-            # SCRATCH, EDGE, BROKEN, CHIP: 중첩 구조 (eqp_col → 장비)
-            if group in ['SCRATCH', 'EDGE', 'BROKEN', 'CHIP']:
-                gap_sub = {}
-                for eqp_col, ref_rates in ref_dict.items():
-                    if not isinstance(ref_rates, dict):
+            gap_sub = {}
+            for eqp_col, eqp_rates in ref_dict.items():
+                if eqp_col not in daily_dict:
+                    daily_rates = {}
+                else:
+                    daily_rates = daily_dict[eqp_col]
+
+                if not isinstance(eqp_rates, dict):
+                    continue
+
+                gap_col = {}
+                for eqp, data in eqp_rates.items():
+                    if not isinstance(data, dict):
                         continue
+                    ref_rate = data.get('rate', 0.0) / 100.0
 
-                    daily_rates = daily_group.get(eqp_col, {})
-                    if not isinstance(daily_rates, dict):
-                        daily_rates = {}
+                    daily_rate = 0.0
+                    if isinstance(daily_rates, dict) and eqp in daily_rates:
+                        daily_data = daily_rates[eqp]
+                        if isinstance(daily_data, dict):
+                            daily_rate = daily_data.get('rate', 0.0) / 100.0
 
-                    gap_col = {}
-                    for eqp_name, data in ref_rates.items():
-                        if not isinstance(data, dict):
-                            continue
-                        ref_rate = data.get('rate', 0.0)
+                    gap = daily_rate - ref_rate
+                    gap_col[eqp] = round(gap, 6)
 
-                        daily_data = daily_rates.get(eqp_name, {})
-                        if not isinstance(daily_data, dict):
-                            daily_rate = 0.0
-                        else:
-                            daily_rate = daily_data.get('rate', 0.0)
+                if gap_col:
+                    gap_sub[eqp_col] = gap_col
 
-                        gap = (daily_rate - ref_rate) / 100.0
-                        gap_col[eqp_name] = gap
-
-                    if isinstance(gap_col, dict) and gap_col:
-                        gap_sub[eqp_col] = gap_col
-
-                if isinstance(gap_sub, dict) and gap_sub:
-                    gap_results[group] = gap_sub
-
-            else:  # 단일 그룹 (PIT, VISUAL 등)
-                gap_sub = {}
-                for eqp_col, ref_rates in ref_dict.items():
-                    if isinstance(ref_rates, dict):
-                        # case 1: 정상 dict → 장비별 데이터 있음
-                        gap_col = {}
-                        for eqp_name, data in ref_rates.items():
-                            if not isinstance(data, dict):
-                                continue
-                            ref_rate = data.get('rate', 0.0)
-
-                            daily_data = daily_group.get(eqp_name, {})
-                            if not isinstance(daily_data, dict):
-                                daily_rate = 0.0
-                            else:
-                                daily_rate = daily_data.get('rate', 0.0)
-
-                            gap = (daily_rate - ref_rate) / 100.0
-                            gap_col[eqp_name] = gap
-
-                        if isinstance(gap_col, dict) and gap_col:
-                            gap_sub[eqp_col] = gap_col
-
-                    elif isinstance(ref_rates, (int, float)):
-                        # case 2: ref_rates가 숫자 → 장비 정보 없음
-                        proc_match = re.search(r'(\d{4})$', eqp_col)
-                        eqp_name_fallback = proc_match.group(1) if proc_match else eqp_col
-
-                        ref_rate = float(ref_rates)
-
-                        daily_rate = 0.0
-                        if isinstance(daily_group, dict):
-                            daily_data = daily_group.get(eqp_col, {})
-                            if isinstance(daily_data, dict):
-                                daily_rate = daily_data.get('rate', 0.0)
-                            elif isinstance(daily_data, (int, float)):
-                                daily_rate = float(daily_data)
-
-                        gap = (daily_rate - ref_rate) / 100.0
-
-                        gap_col = {eqp_name_fallback: gap}
-                        if isinstance(gap_col, dict) and gap_col:
-                            gap_sub[eqp_col] = gap_col
-
-                    else:
-                        # case 3: 예상치 못한 타입
-                        print(f"[WARN] {group} - {eqp_col}: ref_rates 타입 오류 → {type(ref_rates)}")
-                        continue
-
-                if isinstance(gap_sub, dict) and gap_sub:
-                    gap_results[group] = gap_sub
+            if gap_sub:
+                gap_results[group] = gap_sub
             
+
         # [핵심] 60일 데이터 로드 (BASE_DT 기준)
         df_60days_raw = self._load_waf_60days_from_mixed_cache()
         if df_60days_raw.empty:
@@ -2169,7 +2435,51 @@ class DailyReportGenerator:
             # print(f"[WAF] 60일 원본 데이터 로드 완료: {len(df_60days_raw):,} 건")
             # 공정별 데이터셋 생성
             process_datasets = {}
-            # 1. 3670
+            # 1. 3300
+            eqp_col_3300 = 'EQP_NM_300_WF_3300'
+            reg_col_3300 = 'REG_DTTM_300_WF_3300'
+            if reg_col_3300 in df_60days_raw.columns:
+                df_3300 = df_60days_raw.dropna(subset=[reg_col_3300, eqp_col_3300]).copy()
+                df_3300['process_datetime'] = pd.to_datetime(
+                    df_3300[reg_col_3300],
+                    format='%Y%m%d%H%M%S%f',
+                    errors='coerce'
+                )
+
+                # 시간 기준 보정: 07:00 \~ 익일 06:59 까지를 전날 기준일로 묶기 위해 -7시간 이동
+                df_3300['base_dt_7hours'] = (df_3300['process_datetime'] - pd.Timedelta(hours=7)).dt.strftime('%Y%m%d') 
+
+                selected_cols = ['process_datetime','base_dt_7hours','REJ_GROUP', 'BASE_DT','LOSS_QTY', eqp_col_3300]
+                missing_cols = [c for c in selected_cols if c not in df_3300.columns]
+                if missing_cols:
+                    print(f"[3300] 누락된 컬럼: {missing_cols} → 건너뜀")
+                else:
+                    df_3300 = df_3300[selected_cols].rename(columns={eqp_col_3300: 'EQP_NM'})
+                    process_datasets['3300'] = df_3300
+
+            # 2. 3335
+            eqp_col_3335 = 'EQP_NM_300_WF_3335'
+            reg_col_3335 = 'REG_DTTM_300_WF_3335'
+            if reg_col_3335 in df_60days_raw.columns:
+                df_3335 = df_60days_raw.dropna(subset=[reg_col_3335, eqp_col_3335]).copy()
+                df_3335['process_datetime'] = pd.to_datetime(
+                    df_3335[reg_col_3335],
+                    format='%Y%m%d%H%M%S%f',
+                    errors='coerce'
+                )
+
+                # 시간 기준 보정: 07:00 \~ 익일 06:59 까지를 전날 기준일로 묶기 위해 -7시간 이동
+                df_3335['base_dt_7hours'] = (df_3335['process_datetime'] - pd.Timedelta(hours=7)).dt.strftime('%Y%m%d') 
+
+                selected_cols = ['process_datetime','base_dt_7hours','REJ_GROUP', 'BASE_DT','LOSS_QTY', eqp_col_3335]
+                missing_cols = [c for c in selected_cols if c not in df_3335.columns]
+                if missing_cols:
+                    print(f"[3335] 누락된 컬럼: {missing_cols} → 건너뜀")
+                else:
+                    df_3335 = df_3335[selected_cols].rename(columns={eqp_col_3335: 'EQP_NM'})
+                    process_datasets['3335'] = df_3335
+
+            # 3. 3670
             eqp_col_3670 = 'EQP_NM_300_WF_3670'
             reg_col_3670 = 'REG_DTTM_300_WF_3670'
             if reg_col_3670 in df_60days_raw.columns:
@@ -2192,49 +2502,6 @@ class DailyReportGenerator:
                     df_3670 = df_3670[selected_cols].rename(columns={eqp_col_3670: 'EQP_NM'})
                     process_datasets['3670'] = df_3670
 
-            # 2. 6100
-            eqp_col_6100 = 'EQP_NM_300_WF_6100'
-            reg_col_6100 = 'REG_DTTM_300_WF_6100'
-            if reg_col_6100 in df_60days_raw.columns:
-                df_6100 = df_60days_raw.dropna(subset=[reg_col_6100, eqp_col_6100]).copy()
-                df_6100['process_datetime'] = pd.to_datetime(
-                    df_6100[reg_col_6100],
-                    format='%Y%m%d%H%M%S%f',
-                    errors='coerce'
-                )
-
-                # 시간 기준 보정: 07:00 \~ 익일 06:59 까지를 전날 기준일로 묶기 위해 -7시간 이동
-                df_6100['base_dt_7hours'] = (df_6100['process_datetime'] - pd.Timedelta(hours=7)).dt.strftime('%Y%m%d') 
-
-                selected_cols = ['process_datetime','base_dt_7hours','REJ_GROUP', 'BASE_DT','LOSS_QTY', eqp_col_6100]
-                missing_cols = [c for c in selected_cols if c not in df_6100.columns]
-                if missing_cols:
-                    print(f"[6100] 누락된 컬럼: {missing_cols} → 건너뜀")
-                else:
-                    df_6100 = df_6100[selected_cols].rename(columns={eqp_col_6100: 'EQP_NM'})
-                    process_datasets['6100'] = df_6100
-
-            # 3. 3335
-            eqp_col_3335 = 'EQP_NM_300_WF_3335'
-            reg_col_3335 = 'REG_DTTM_300_WF_3335'
-            if reg_col_3335 in df_60days_raw.columns:
-                df_3335 = df_60days_raw.dropna(subset=[reg_col_3335, eqp_col_3335]).copy()
-                df_3335['process_datetime'] = pd.to_datetime(
-                    df_3335[reg_col_3335],
-                    format='%Y%m%d%H%M%S%f',
-                    errors='coerce'
-                )
-
-                # 시간 기준 보정: 07:00 \~ 익일 06:59 까지를 전날 기준일로 묶기 위해 -7시간 이동
-                df_3335['base_dt_7hours'] = (df_3335['process_datetime'] - pd.Timedelta(hours=7)).dt.strftime('%Y%m%d') 
-
-                selected_cols = ['process_datetime','base_dt_7hours','REJ_GROUP', 'BASE_DT','LOSS_QTY', eqp_col_3335]
-                missing_cols = [c for c in selected_cols if c not in df_3335.columns]
-                if missing_cols:
-                    print(f"[3335] 누락된 컬럼: {missing_cols} → 건너뜀")
-                else:
-                    df_3335 = df_3335[selected_cols].rename(columns={eqp_col_3335: 'EQP_NM'})
-                    process_datasets['3335'] = df_3335
 
             # 4. 3696
             eqp_col_3696 = 'EQP_NM_300_WF_3696'
@@ -2258,7 +2525,52 @@ class DailyReportGenerator:
                     df_3696 = df_3696[selected_cols].rename(columns={eqp_col_3696: 'EQP_NM'})
                     process_datasets['3696'] = df_3696
 
-            # 5. 6500
+
+            # 5. 6100
+            eqp_col_6100 = 'EQP_NM_300_WF_6100'
+            reg_col_6100 = 'REG_DTTM_300_WF_6100'
+            if reg_col_6100 in df_60days_raw.columns:
+                df_6100 = df_60days_raw.dropna(subset=[reg_col_6100, eqp_col_6100]).copy()
+                df_6100['process_datetime'] = pd.to_datetime(
+                    df_6100[reg_col_6100],
+                    format='%Y%m%d%H%M%S%f',
+                    errors='coerce'
+                )
+
+                # 시간 기준 보정: 07:00 \~ 익일 06:59 까지를 전날 기준일로 묶기 위해 -7시간 이동
+                df_6100['base_dt_7hours'] = (df_6100['process_datetime'] - pd.Timedelta(hours=7)).dt.strftime('%Y%m%d') 
+
+                selected_cols = ['process_datetime','base_dt_7hours','REJ_GROUP', 'BASE_DT','LOSS_QTY', eqp_col_6100]
+                missing_cols = [c for c in selected_cols if c not in df_6100.columns]
+                if missing_cols:
+                    print(f"[6100] 누락된 컬럼: {missing_cols} → 건너뜀")
+                else:
+                    df_6100 = df_6100[selected_cols].rename(columns={eqp_col_6100: 'EQP_NM'})
+                    process_datasets['6100'] = df_6100
+
+            # 6. 6210
+            eqp_col_6210 = 'EQP_NM_300_WF_6210'
+            reg_col_6210 = 'REG_DTTM_300_WF_6210'
+            if reg_col_6210 in df_60days_raw.columns:
+                df_6210 = df_60days_raw.dropna(subset=[reg_col_6210, eqp_col_6210]).copy()
+                df_6210['process_datetime'] = pd.to_datetime(
+                    df_6210[reg_col_6210],
+                    format='%Y%m%d%H%M%S%f',
+                    errors='coerce'
+                )
+
+                # 시간 기준 보정: 07:00 \~ 익일 06:59 까지를 전날 기준일로 묶기 위해 -7시간 이동
+                df_6210['base_dt_7hours'] = (df_6210['process_datetime'] - pd.Timedelta(hours=7)).dt.strftime('%Y%m%d') 
+
+                selected_cols = ['process_datetime','base_dt_7hours','REJ_GROUP', 'BASE_DT','LOSS_QTY', eqp_col_6210]
+                missing_cols = [c for c in selected_cols if c not in df_6210.columns]
+                if missing_cols:
+                    print(f"[6210] 누락된 컬럼: {missing_cols} → 건너뜀")
+                else:
+                    df_6210 = df_6210[selected_cols].rename(columns={eqp_col_6210: 'EQP_NM'})
+                    process_datasets['6210'] = df_6210
+
+            # 7. 6500
             eqp_col_6500 = 'EQP_NM_300_WF_6500'
             reg_col_6500 = 'REG_DTTM_300_WF_6500'
             if reg_col_6500 in df_60days_raw.columns:
@@ -2279,29 +2591,8 @@ class DailyReportGenerator:
                 else:
                     df_6500 = df_6500[selected_cols].rename(columns={eqp_col_6500: 'EQP_NM'})
                     process_datasets['6500'] = df_6500
-            # 6. 3300
-            eqp_col_3300 = 'EQP_NM_300_WF_3300'
-            reg_col_3300 = 'REG_DTTM_300_WF_3300'
-            if reg_col_3300 in df_60days_raw.columns:
-                df_3300 = df_60days_raw.dropna(subset=[reg_col_3300, eqp_col_3300]).copy()
-                df_3300['process_datetime'] = pd.to_datetime(
-                    df_3300[reg_col_3300],
-                    format='%Y%m%d%H%M%S%f',
-                    errors='coerce'
-                )
 
-                # 시간 기준 보정: 07:00 \~ 익일 06:59 까지를 전날 기준일로 묶기 위해 -7시간 이동
-                df_3300['base_dt_7hours'] = (df_3300['process_datetime'] - pd.Timedelta(hours=7)).dt.strftime('%Y%m%d') 
-
-                selected_cols = ['process_datetime','base_dt_7hours','REJ_GROUP', 'BASE_DT','LOSS_QTY', eqp_col_3300]
-                missing_cols = [c for c in selected_cols if c not in df_3300.columns]
-                if missing_cols:
-                    print(f"[3300] 누락된 컬럼: {missing_cols} → 건너뜀")
-                else:
-                    df_3300 = df_3300[selected_cols].rename(columns={eqp_col_3300: 'EQP_NM'})
-                    process_datasets['3300'] = df_3300
-
-            # 7. 7000
+            # 8. 7000
             eqp_col_7000 = 'EQP_NM_300_WF_7000'
             reg_col_7000 = 'REG_DTTM_300_WF_7000'
             if reg_col_7000 in df_60days_raw.columns:
@@ -2392,7 +2683,8 @@ class DailyReportGenerator:
         # [4] 공정별 데이터셋 분리
         # ===================================================================
         inqty_datasets = {}
-        target_procs = ['3670', '6100', '3335', '3696', '6500', '3300', '7000']
+        target_procs = ['3300', '3335', '3670', '3696', '6100', '6210', '6500', '7000']
+
 
         for proc in target_procs:
             df_proc = df_filtered[df_filtered['oper_id'] == proc].copy()
@@ -2445,6 +2737,7 @@ class DailyReportGenerator:
 
             # REJ_GROUP 기준으로 LOSS_QTY 합계
             df_num_grouped = df_num.groupby(['base_dt', 'eqp_name', 'REJ_GROUP'])['LOSS_QTY'].sum().reset_index()
+
             # ===================================================================
             # [2] 분모 데이터 준비 (IN_QTY)
             # ===================================================================
@@ -2463,28 +2756,53 @@ class DailyReportGenerator:
                 df_denom_grouped,
                 df_num_grouped,
                 on=['base_dt', 'eqp_name'],
-                how='left'
+                how='outer'
             )
 
             # ===================================================================
             # [4] LOSS_RATE 계산
             # ===================================================================
-            df_merge['LOSS_QTY'] = df_merge['LOSS_QTY'].astype(float)
+            df_merge['LOSS_QTY'] = df_merge['LOSS_QTY'].fillna(0).astype(float)
             df_merge['IN_QTY'] = df_merge['IN_QTY'].fillna(0).astype(float)
 
-            # 방어적 나누기
-            df_merge['LOSS_RATE'] = (
-                df_merge['LOSS_QTY'] / (df_merge['IN_QTY'] + 1e-9)
-            ) * 100
-            df_merge['LOSS_RATE'] = df_merge['LOSS_RATE'].round(4)
+
+            # ===================================================================
+            # [4] REJ_GROUP Pivot (행 → 컬럼)
+            # ===================================================================
+            pivot_cols = ['base_dt', 'eqp_name', 'IN_QTY', 'REJ_GROUP', 'LOSS_QTY']
+            df_pivot = df_merge[pivot_cols].copy()
+            
+            # Pivot 수행
+            df_pivot = df_pivot.pivot_table(
+                index=['base_dt', 'eqp_name', 'IN_QTY'],
+                columns='REJ_GROUP',
+                values='LOSS_QTY',
+                aggfunc='sum',
+                fill_value=0  # 불량 없는 경우 0
+            ).reset_index()
+            
+            # 컬럼명 정리 (MultiIndex 제거)
+            df_pivot.columns.name = None
+
+        # ===================================================================
+            # [5] LOSS_RATE 계산 (전체 불량률)
+            # ===================================================================
+            # 전체 불량 수량 (모든 REJ_GROUP 합계)
+            rej_cols = [c for c in df_pivot.columns if c not in ['base_dt', 'eqp_name', 'IN_QTY']]
+            df_pivot['TOTAL_LOSS_QTY'] = df_pivot[rej_cols].sum(axis=1)
+            
+            # 각 불량 유형별로 LOSS_RATE 컬럼 생성
+            for rej in rej_cols:
+                rate_col = f"{rej}_RATE"
+                df_pivot[rate_col] = (
+                    df_pivot[rej] / (df_pivot['IN_QTY'] + 1e-9)
+                ) * 100
+                df_pivot[rate_col] = df_pivot[rate_col].round(4)
 
             # 날짜 정렬
-            df_merge = df_merge.sort_values(['base_dt', 'eqp_name']).reset_index(drop=True)
+            df_pivot = df_pivot.sort_values(['base_dt', 'eqp_name']).reset_index(drop=True)
 
-            # ===================================================================
-            # [5] 저장
-            # ===================================================================
-            loss_rate_results[proc] = df_merge
+            loss_rate_results[proc] = df_pivot
 
         # 최종 저장
         self.data['LOSS_RATE_BY_EQP'] = loss_rate_results
@@ -2509,9 +2827,30 @@ class DailyReportGenerator:
         # ===================================================================
         # [2] top3_rej_groups 및 valid_groups 확인
         # ===================================================================
-        top3_rej_groups = self.data.get('DATA_3210_wafering_300', {}).get('top3_rej_groups', [])
-        # top3_rej_groups = ['PIT', 'EDGE', 'VISUAL']
-        valid_groups = [g for g in top3_rej_groups if g in ['PIT', 'SCRATCH', 'EDGE', 'BROKEN', 'CHIP', 'VISUAL']]
+        # top3_rej_groups = self.data.get('DATA_3210_wafering_300', {}).get('top3_rej_groups', [])
+        top3_rej_groups = ['BROKEN', 'EDGE', 'CHIP']
+        # 지원되는 상위 그룹 정의 (기존 조건 반영)
+        SUPPORTED_TOP_GROUPS = ['PIT', 'SCRATCH', 'EDGE', 'BROKEN', 'CHIP', 'VISUAL']
+
+        # 1. expanded_groups 생성 (BROKEN, CHIP 확장)
+        expanded_groups = []
+                    
+        for g in top3_rej_groups:
+            if g == 'BROKEN' and g in SUPPORTED_TOP_GROUPS:
+                expanded_groups.extend(['LAP_BROKEN', 'EP_BROKEN', 'DSP_BROKEN', 'FP_BROKEN'])
+            elif g == 'CHIP' and g in SUPPORTED_TOP_GROUPS:
+                expanded_groups.extend([
+                    'CHIP-LAP', 
+                    'EDGE-CHIP', 
+                    'CHIP_EG1AF', 
+                    'CHIP_EG1BF',
+                    'E_CHIP'
+                ])
+            elif g in SUPPORTED_TOP_GROUPS:
+                expanded_groups.append(g)
+            # else: 지원 안 함 → 무시
+
+        valid_groups = [g for g in expanded_groups]
 
         if not valid_groups:
             print("[WARNING] 유효한 REJ_GROUP 없음 → 그래프 생성 중단")
@@ -2531,15 +2870,22 @@ class DailyReportGenerator:
         # [4] LOSS_RATE_BY_EQP 통합
         # ===================================================================
         try:
-            df_all_loss = pd.concat([
-                df.assign(PROC_CD=proc) for proc, df in self.data['LOSS_RATE_BY_EQP'].items() if not df.empty
-            ], ignore_index=True)
-
+            df_list = []
+            for proc, df in self.data['LOSS_RATE_BY_EQP'].items():
+                if df.empty:
+                    continue
+                df = df.copy()
+                df['PROC_CD'] = proc
+                df_list.append(df)
+            
+            df_all_loss = pd.concat(df_list, ignore_index=True)
+            
             if df_all_loss.empty:
                 print("[ERROR] LOSS_RATE_BY_EQP 통합 결과가 빈 데이터프레임")
                 return {}
 
-            df_all_loss['base_dt'] = pd.to_datetime(df_all_loss['base_dt'], format='%Y%m%d', errors='coerce')
+            # base_dt를 datetime으로 변환
+            df_all_loss['base_dt_dt'] = pd.to_datetime(df_all_loss['base_dt'], format='%Y%m%d', errors='coerce')
 
         except Exception as e:
             print(f"[ERROR] df_all_loss 생성 실패: {e}")
@@ -2570,77 +2916,158 @@ class DailyReportGenerator:
                 graph_paths[rej_group] = []
                 continue
 
-            # 상위 3개 장비 추출
-            top3_eqps = []
-            if isinstance(gap_data, dict) and isinstance(next(iter(gap_data.values()), {}), dict):
-                for eqp_col, rates in gap_data.items():
-                    sorted_rates = sorted(rates.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
-                    top3_eqps.extend([eqp for eqp, _ in sorted_rates])
-            else:
-                sorted_rates = sorted(gap_data.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
-                top3_eqps.extend([eqp for eqp, _ in sorted_rates])
-
-            top3_eqps = list(dict.fromkeys(top3_eqps))[:3]  # 중복 제거 후 상위 3개
-
-            if not top3_eqps:
-                graph_paths[rej_group] = []
-                continue
-
-            # 데이터 필터링
-            df_rej = df_all_loss[
-                (df_all_loss['REJ_GROUP'] == rej_group) &
-                (df_all_loss['eqp_name'].isin(top3_eqps))
-            ][['base_dt', 'eqp_name', 'IN_QTY', 'LOSS_RATE']].copy()
-
-            if df_rej.empty:
-                graph_paths[rej_group] = []
-                continue
-
-            # 날짜 확보: 각 장비별로 reindex
-            df_rej['base_dt_dt'] = pd.to_datetime(df_rej['base_dt'], format='%Y%m%d')
-            df_rej = df_rej.sort_values('base_dt_dt')
-
-            latest_date = df_rej['base_dt_dt'].max()
-            start_date = latest_date - timedelta(days=59)
-            all_dates = pd.date_range(start=start_date, end=latest_date, freq='D')
-            all_dates_str = all_dates.strftime('%Y%m%d')
-
             # 장비별 그래프 생성
             eqp_graph_paths = []
-            for eqp in top3_eqps:
-                df_eqp = df_rej[df_rej['eqp_name'] == eqp].copy()
+            if isinstance(gap_data, dict):
+                for eqp_col, rates in gap_data.items():
+                    if not isinstance(rates, dict):
+                        continue
 
-                if df_eqp.empty:
+                    top3_eqps_in_col = sorted(rates.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+                    top3_eqps_in_col = [eqp for eqp, _ in top3_eqps_in_col]
+
+                    for eqp in top3_eqps_in_col:
+                        df_eqp_raw = df_all_loss[df_all_loss['eqp_name'] == eqp].copy()
+                        if df_eqp_raw.empty:
+                            continue
+
+                        # LOSS_RATE 컬럼명
+                        rate_col = f"{rej_group}_RATE"
+
+                        # base_dt 기준 집계
+                        agg_dict = {'IN_QTY': 'sum'}
+                        if rate_col in df_eqp_raw.columns:
+                            agg_dict[rate_col] = 'max'
+                        df_eqp = df_eqp_raw.groupby('base_dt').agg(agg_dict).reset_index()
+
+                        # 날짜 보정
+                        latest_date = df_eqp['base_dt'].max()
+                        latest_dt = pd.to_datetime(latest_date, format='%Y%m%d')
+                        start_dt = latest_dt - timedelta(days=59)
+                        all_dates = pd.date_range(start=start_dt, end=latest_dt, freq='D')
+                        all_dates_str = all_dates.strftime('%Y%m%d')
+
+                        df_plot = df_eqp.set_index('base_dt').reindex(all_dates_str, fill_value=0).reset_index()
+                        df_plot['base_dt_dt'] = pd.to_datetime(df_plot['index'], format='%Y%m%d')
+                        df_plot = df_plot.sort_values('base_dt_dt')
+
+                        df_plot['IN_QTY'] = df_plot['IN_QTY'].fillna(0)
+                        loss_rate_series = df_plot[rate_col].fillna(0.0).values if rate_col in df_plot.columns else np.zeros(len(df_plot))
+
+                        # 그래프 생성
+                        plt.figure(figsize=(12, 6))
+                        ax1 = plt.gca()
+
+                        # 막대: IN_QTY
+                        ax1.bar(df_plot['base_dt_dt'], df_plot['IN_QTY'],
+                                color='lightgray', alpha=0.7, label='IN_QTY', width=0.8)
+                        ax1.set_xlabel('Date', fontsize=12, fontweight='bold')
+                        ax1.set_ylabel('IN 수량', color='lightgray', fontsize=12, fontweight='bold')
+                        ax1.tick_params(axis='y', labelcolor='lightgray')
+                        ax1.set_ylim(0, max(df_plot['IN_QTY'].max() * 1.5, 4000))
+                        ax1.grid(axis='y', linestyle='--', alpha=0.3)
+
+                        # 선: LOSS_RATE
+                        ax2 = ax1.twinx()
+                        ax2.plot(df_plot['base_dt_dt'], loss_rate_series,
+                                marker='o', linestyle='-', linewidth=2, markersize=4,
+                                color='darkred', label='LOSS_RATE')
+                        ax2.set_ylabel('불량률(%)', color='darkred', fontsize=12, fontweight='bold')
+                        ax2.tick_params(axis='y', labelcolor='darkred')
+
+                        max_rate = loss_rate_series.max()
+                        ax2.set_ylim(0, max(max_rate * 1.5, 0.1) if max_rate > 0 else 1)
+
+                        # 제목에 eqp_col 추가 (디버깅 용이)
+                        plt.title(f'{rej_group} - {eqp} ({eqp_col[-4:]})',
+                                fontsize=14, fontweight='bold', pad=20)
+
+                        lines1, labels1 = ax1.get_legend_handles_labels()
+                        lines2, labels2 = ax2.get_legend_handles_labels()
+                        ax1.legend(lines1 + lines2, labels1 + labels2,
+                                loc='upper left', fontsize=10, framealpha=0.9)
+
+                        plt.xticks(rotation=45, ha='right')
+                        ax1.set_xlim(all_dates[0], all_dates[-1])
+                        plt.tight_layout()
+
+                        # 파일명: 불량_장비_base_date.png
+                        safe_rej = "".join(c if c.isalnum() else "_" for c in rej_group)
+                        safe_eqp = "".join(c if c.isalnum() else "_" for c in eqp)
+                        filename = f"loss_rate_{safe_rej}_{safe_eqp}_{base_date}.png"
+                        filepath = debug_dir / filename
+
+                        if filepath.exists():
+                            filepath.unlink()
+                        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+                        plt.close()
+
+                        eqp_graph_paths.append(str(filepath))
+                        print(f"[SUCCESS] 개별 그래프 생성: {filepath}")
+            else:
+                # gap_data가 flat dict인 경우 (예: SCRATCH)
+                sorted_rates = sorted(gap_data.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+                top3_eqps = [eqp for eqp, _ in sorted_rates]
+                for eqp in top3_eqps:
+
+                    df_eqp_raw = df_all_loss[df_all_loss['eqp_name'] == eqp].copy()
+                if df_eqp_raw.empty:
                     continue
 
-                # 해당 장비만 reindex
-                df_eqp = df_eqp.set_index('base_dt').reindex(all_dates_str, fill_value=0).reset_index()
-                df_eqp['base_dt_dt'] = pd.to_datetime(df_eqp['index'], format='%Y%m%d')
-                df_eqp = df_eqp.sort_values('base_dt_dt')
+                # LOSS_RATE 컬럼명 확인
+                rate_col = f"{rej_group}_RATE"
+
+                # base_dt 기준으로 집계 (중복 제거)
+                agg_dict = {'IN_QTY': 'sum'}
+                if rate_col in df_eqp_raw.columns:
+                    agg_dict[rate_col] = 'max'  # 또는 'mean'
+                
+                df_eqp = df_eqp_raw.groupby('base_dt').agg(agg_dict).reset_index()
+
+                # 날짜 기준 reindex (모든 날짜 포함, 누락 시 0)
+                df_plot = df_eqp.set_index('base_dt').reindex(all_dates_str, fill_value=0).reset_index()
+                df_plot['base_dt_dt'] = pd.to_datetime(df_plot['index'], format='%Y%m%d')
+                df_plot = df_plot.sort_values('base_dt_dt')
+
+                # IN_QTY: 누락 시 0 (이미 fill_value=0 처리됨)
+                df_plot['IN_QTY'] = df_plot['IN_QTY'].fillna(0)
+
+                # LOSS_RATE: 해당 REJ_GROUP 의 _RATE 컬럼 사용
+                if rate_col in df_plot.columns:
+                    loss_rate_series = df_plot[rate_col].fillna(0.0).values
+                else:
+                    loss_rate_series = np.zeros(len(df_plot))
+
 
                 # 그래프 생성
                 plt.figure(figsize=(12, 6))
                 ax1 = plt.gca()
 
                 # 막대: IN_QTY
-                ax1.bar(df_eqp['base_dt_dt'], df_eqp['IN_QTY'],
+                ax1.bar(df_plot['base_dt_dt'], df_plot['IN_QTY'],
                         color='lightgray', alpha=0.7, label='IN_QTY', width=0.8)
                 ax1.set_xlabel('Date', fontsize=12, fontweight='bold')
                 ax1.set_ylabel('IN 수량', color='lightgray', fontsize=12, fontweight='bold')
                 ax1.tick_params(axis='y', labelcolor='lightgray')
+                ax1.set_ylim(0, max(df_plot['IN_QTY'].max() * 1.5, 4000))
                 ax1.grid(axis='y', linestyle='--', alpha=0.3)
 
                 # 선: LOSS_RATE
                 ax2 = ax1.twinx()
-                loss_rate = df_eqp['LOSS_RATE'].values
-                ax2.plot(df_eqp['base_dt_dt'], loss_rate,
+                ax2.plot(df_plot['base_dt_dt'], loss_rate_series,
                         marker='o', linestyle='-', linewidth=2, markersize=4,
                         color='darkred', label='LOSS_RATE')
                 ax2.set_ylabel('불량률(%)', color='darkred', fontsize=12, fontweight='bold')
                 ax2.tick_params(axis='y', labelcolor='darkred')
-                ax2.set_ylim(0, max(loss_rate.max() * 1.5, 1))
 
-                # 제목: 장비별
+                # Y 축 범위 조정 (0.03 → 실제 값 기반)
+                max_rate = loss_rate_series.max()
+                if max_rate > 0:
+                    ax2.set_ylim(0, max(max_rate * 1.5, 0.1))  # 최소 0.1%
+                else:
+                    ax2.set_ylim(0, 1)
+
+                # 제목
                 plt.title(f'{rej_group} - {eqp} 불량률',
                         fontsize=14, fontweight='bold', pad=20)
 
@@ -2655,13 +3082,12 @@ class DailyReportGenerator:
                 ax1.set_xlim(all_dates[0], all_dates[-1])
                 plt.tight_layout()
 
-                # 파일 저장: 장비명 포함
+                # 파일 저장
                 safe_rej = "".join(c if c.isalnum() else "_" for c in rej_group)
                 safe_eqp = "".join(c if c.isalnum() else "_" for c in eqp)
                 filename = f"loss_rate_{safe_rej}_{safe_eqp}_{base_date}.png"
                 filepath = debug_dir / filename
 
-                # 기존 파일이 있으면 삭제
                 if filepath.exists():
                     filepath.unlink()
                     print(f"[INFO] 기존 파일 삭제: {filepath}")
@@ -2671,15 +3097,17 @@ class DailyReportGenerator:
                 eqp_graph_paths.append(str(filepath))
                 print(f"[SUCCESS] 개별 그래프 생성: {filepath}")
 
-            graph_paths[rej_group] = eqp_graph_paths  # 장비별 여러 그래프 저장
+            graph_paths[rej_group] = eqp_graph_paths
 
-            # 결과 저장
-            if not hasattr(self, 'report'):
-                self.report = {}
-            self.data['EQP_TREND_GRAPHS'] = graph_paths
-            print(f"[OK] EQP_TREND_GRAPHS 저장: {list(graph_paths.keys())}")
+        # ===================================================================
+        # [7] 결과 저장
+        # ===================================================================
+        if not hasattr(self, 'report'):
+            self.report = {}
+        self.data['EQP_TREND_GRAPHS'] = graph_paths
+        print(f"[OK] EQP_TREND_GRAPHS 저장: {list(graph_paths.keys())}")
 
-        return graph_paths  # 반환 형식: {'SCRATCH': [path1, path2], 'BROKEN': [...], ...}
+        return graph_paths
 
 
     def _export_to_excel(self, report, output_dir="./daily_reports_debug"):
@@ -2716,332 +3144,292 @@ class DailyReportGenerator:
             # ──────────────────────────────────────────────────
             # 1. [3010 수율 분석] 제목 및 그래프 삽입 (가장 위)
             # ──────────────────────────────────────────────────
-            ws.merge_cells('A1:G1')
-            ws['A1'] = "[ WF RTY 수율 비교 (월/일) ]"
-            ws['A1'].font = Font(size=14, bold=True)
-            ws['A1'].alignment = Alignment(horizontal='left')
+            title_cell = ws.cell(row=1, column=1, value="[ WF RTY 수율 비교 (월/일) ]")
+            title_cell.font = Font(size=12, bold=True)
+            title_cell.alignment = Alignment(horizontal='left')
 
             data_3010_details = report.get('DATA_3010_wafering_300', {})
             chart_path_3010 = data_3010_details.get('chart_path')
             table_df_3010 = data_3010_details.get('table_df')
 
-
             # ──────────────────────────────────────────────────
-            # [추가] 월/일 Total RTY Gap 요약 텍스트 생성
+            # 1. Gap 데이터 추출 (일 기준, RTY & OAY, Total & Prime)
             # ──────────────────────────────────────────────────
-            gap_month = None
-            gap_daily = None
-
+            gap_data = {}
             if table_df_3010 is not None and not table_df_3010.empty:
-                # Total RTY Gap 추출 (첫 번째 행)
-                if 'Gap(월)' in table_df_3010.columns and len(table_df_3010) > 0:
-                    try:
-                        gap_month = float(table_df_3010.iloc[0]['Gap(월)'])
-                        gap_daily = float(table_df_3010.iloc[0]['Gap(일)'])
-                    except:
-                        pass
+                for yld_type in ['RTY', 'OAY']:
+                    for grade in ['Total', 'Prime']:
+                        mask = (table_df_3010['yld_type'] == yld_type) & (table_df_3010['grade'] == grade)
+                        filtered = table_df_3010[mask]
+                        if not filtered.empty:
+                            gap_val = filtered.iloc[0].get('daily_gap')  # 일 기준
+                            if gap_val is not None:
+                                try:
+                                    gap_data[f'{yld_type}_{grade}'] = float(gap_val)
+                                except:
+                                    gap_data[f'{yld_type}_{grade}'] = None
+                            else:
+                                gap_data[f'{yld_type}_{grade}'] = None
+                        else:
+                            gap_data[f'{yld_type}_{grade}'] = None
 
-
-            # 달성/미달 판정 함수
-            def get_achieve_status(gap):
+            # ──────────────────────────────────────────────────
+            # 2. 상태 및 색상 판정 함수
+            # ──────────────────────────────────────────────────
+            def get_status_and_color(gap):
                 if gap is None:
-                    return "N/A"
+                    return "N/A", "999999"
                 if gap < 0:
-                    return "달성"
+                    return "미달", "FF0000"  # 빨강
                 elif gap > 0:
-                    return "미달"
+                    return "달성", "0000FF"  # 파랑
                 else:
-                    return "달성"  # 0 은 달성으로 간주
+                    return "달성", "000000"  # 검정
 
-            # 텍스트 생성
-            month_text = f"-. 월 : "
-            if gap_month is not None:
-                month_text += f"Total RTY {gap_month:.2f}% {get_achieve_status(gap_month)}"
+            # ──────────────────────────────────────────────────
+            # 3. Row 2: 일 기준 RTY 요약 (한 줄)
+            # ──────────────────────────────────────────────────
+            # A2: -. 일 : Total RTY
+            ws.cell(row=2, column=1, value="-. 일 : Total RTY")
+            ws.cell(row=2, column=1).font = Font(size=10, bold=False, color="000000")
+            ws.cell(row=2, column=1).alignment = Alignment(horizontal='right')
+
+            # B2: Gap + 상태 (Total RTY)
+            gap_rty_total = gap_data.get('RTY_Total')
+            if gap_rty_total is not None:
+                status, color = get_status_and_color(gap_rty_total)
+                ws.cell(row=2, column=2, value=f"{gap_rty_total:.2f}%p {status}")
+                ws.cell(row=2, column=2).font = Font(size=10, bold=True, color=color)
+                ws.cell(row=2, column=2).alignment = Alignment(horizontal='center')
             else:
-                month_text += "데이터 없음"
+                ws.cell(row=2, column=2, value="N/A").font = Font(size=10, color="999999")
 
-            daily_text = f"-. 일 : "
-            if gap_daily is not None:
-                daily_text += f"Total RTY {gap_daily:.2f}% {get_achieve_status(gap_daily)}"
+            # C2: Prime RTY
+            ws.cell(row=2, column=3, value="Prime RTY")
+            ws.cell(row=2, column=3).font = Font(size=10, bold=False, color="000000")
+            ws.cell(row=2, column=3).alignment = Alignment(horizontal='left')
+
+            # D2: Gap + 상태 (Prime RTY)
+            gap_rty_prime = gap_data.get('RTY_Prime')
+            if gap_rty_prime is not None:
+                status, color = get_status_and_color(gap_rty_prime)
+                ws.cell(row=2, column=4, value=f"{gap_rty_prime:.2f}%p {status}")
+                ws.cell(row=2, column=4).font = Font(size=10, bold=True, color=color)
+                ws.cell(row=2, column=4).alignment = Alignment(horizontal='center')
             else:
-                daily_text += "데이터 없음"
+                ws.cell(row=2, column=4, value="N/A").font = Font(size=10, color="999999")
 
-            # A2, A3 에 요약 텍스트 출력
-            ws['A2'] = month_text
-            ws['A2'].font = Font(size=10, bold=False)
-            ws['A2'].alignment = Alignment(horizontal='left')
+            # ──────────────────────────────────────────────────
+            # 4. Row 3: OAY 요약 (다음 줄, 들여쓰기 없이)
+            # ──────────────────────────────────────────────────
+            # A3: Total OAY
+            ws.cell(row=3, column=1, value="Total OAY")
+            ws.cell(row=3, column=1).font = Font(size=10, bold=False, color="000000")
+            ws.cell(row=3, column=1).alignment = Alignment(horizontal='right')
 
-            ws['A3'] = daily_text
-            ws['A3'].font = Font(size=10, bold=False)
-            ws['A3'].alignment = Alignment(horizontal='left')
+            # B3: Gap + 상태 (Total OAY)
+            gap_oay_total = gap_data.get('OAY_Total')
+            if gap_oay_total is not None:
+                status, color = get_status_and_color(gap_oay_total)
+                ws.cell(row=3, column=2, value=f"{gap_oay_total:.2f}%p {status}")
+                ws.cell(row=3, column=2).font = Font(size=10, bold=True, color=color)
+                ws.cell(row=3, column=2).alignment = Alignment(horizontal='center')
+            else:
+                ws.cell(row=3, column=2, value="N/A").font = Font(size=10, color="999999")
+
+            # C3: Prime OAY
+            ws.cell(row=3, column=3, value="Prime OAY")
+            ws.cell(row=3, column=3).font = Font(size=10, bold=False, color="000000")
+            ws.cell(row=3, column=3).alignment = Alignment(horizontal='left')
+
+            # D3: Gap + 상태 (Prime OAY)
+            gap_oay_prime = gap_data.get('OAY_Prime')
+            if gap_oay_prime is not None:
+                status, color = get_status_and_color(gap_oay_prime)
+                ws.cell(row=3, column=4, value=f"{gap_oay_prime:.2f}%p {status}")
+                ws.cell(row=3, column=4).font = Font(size=10, bold=True, color=color)
+                ws.cell(row=3, column=4).alignment = Alignment(horizontal='center')
+            else:
+                ws.cell(row=3, column=4, value="N/A").font = Font(size=10, color="999999")
 
             if not chart_path_3010:
-                ws['A4'] = "[차트 없음: chart_path 없음]"
-                ws['A4'].font = Font(size=10, color="FF0000")
+                ws.cell(row=4, column=1, value="[차트 없음: chart_path 없음]").font = Font(size=10, color="FF0000")
                 print("3010: 삽입할 chart_path 없음")
             else:
                 chart_path_3010 = Path(chart_path_3010)
                 if not chart_path_3010.exists():
-                    ws['A4'] = f"[차트 파일 없음: {chart_path_3010.name}]"
-                    ws['A4'].font = Font(size=10, color="FF0000")
+                    ws.cell(row=4, column=1, value=f"[차트 파일 없음: {chart_path_3010.name}]").font = Font(size=10, color="FF0000")
                     print(f"3010: 차트 파일 없음: {chart_path_3010}")
                 else:
                     try:
                         img = ExcelImage(str(chart_path_3010))
-                        img.width = 600
+                        img.width = 800
                         img.height = 300
                         ws.add_image(img, 'A4')
                     except Exception as e:
-                        ws['A4'] = f"[이미지 삽입 실패: {e}]"
-                        ws['A4'].font = Font(size=10, color="FF0000")
-
-            # 3010 표 삽입 (H2 \~ K6)
+                        ws.cell(row=4, column=1, value=f"[이미지 삽입 실패: {e}]").font = Font(size=10, color="FF0000")
 
             if table_df_3010 is not None and not table_df_3010.empty:
-                start_row = 4
-                start_col = 8  # H열
+                start_row = 19
+                start_col = 1  # A열
+              # 1. 상단 헤더 (구분, 월, 일)
+                cell_a = ws.cell(row=start_row, column=1, value='구분')
+                ws.merge_cells(f'A{start_row}:B{start_row}')
+                cell_a.font = HEADER_FONT
+                cell_a.alignment = CENTER_WRAP
+                cell_a.fill = HEADER_FILL
+                for col in range(1, 3):  # A=1, B=2
+                    ws.cell(row=start_row, column=col).border = Border(
+                        left=Side(style='medium'),
+                        right=Side(style='medium'),
+                        top=Side(style='medium'),  
+                        bottom=Side(style='thin')
+                    )
 
-                table_df_3010_fmt = table_df_3010.copy()
-                pct_cols = ['월 목표', '월 실적', '일 목표', '일 실적', 'Gap(월)', 'Gap(일)']
-                for col in pct_cols:
-                    if col in table_df_3010_fmt.columns:
-                        table_df_3010_fmt[col] = pd.to_numeric(table_df_3010_fmt[col], errors='coerce') / 100.0
+                cell_a20 = ws.cell(row=start_row+1, column=1)
 
-                for r_idx, row in enumerate(dataframe_to_rows(table_df_3010_fmt, index=False, header=True), start_row):
-                    for c_idx, value in enumerate(row, start_col):
-                        cell = ws.cell(row=r_idx, column=c_idx, value=value)
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
-                        cell.font = Font(size=9)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                # 값은 없음 (빈 셀)
+                cell_a20.value = None
 
-                        if r_idx == start_row:  # 헤더
-                            cell.font = Font(bold=True, size=10)
-                            cell.fill = PatternFill("solid", fgColor="D3D3D3")
-                        else:
-                            if c_idx in [start_col + 5, start_col + 6]:  # Gap 컬럼
-                                try:
-                                    gap_val = float(value) if pd.notna(value) else 0.0
-                                    if gap_val > 0:
-                                        cell.fill = PatternFill("solid", fgColor="FFCCCC")
-                                        cell.font = Font(color="FF0000", bold=False, size=9)
-                                    elif gap_val < 0:
-                                        cell.fill = PatternFill("solid", fgColor="CCE5FF")
-                                        cell.font = Font(color="0000FF", bold=False, size=9)
-                                except:
-                                    pass
-                            cell.number_format = '0.00%'
+                # 스타일만 복사 (병합 없이)
+                cell_a20.font = HEADER_FONT
+
+                # C19: '월'
+                ws.merge_cells(f'C{start_row}:E{start_row}')
+                cell_c = ws.cell(row=start_row, column=3)
+                cell_c.font = HEADER_FONT
+                cell_c.alignment = CENTER_WRAP
+                cell_c.fill = HEADER_FILL
+                # ✅ C19:E19 병합된 범위의 각 셀에 border 적용
+                for col in range(3, 6):  # C=3, D=4, E=5
+                    ws.cell(row=start_row, column=col).border = Border(
+                        left=Side(style='medium'),
+                        right=Side(style='medium'),
+                        top=Side(style='medium'),  # ✅ top medium
+                        bottom=Side(style='thin')
+                    )
+                cell_c.value = '월'
+
+                # F19: '일'
+                ws.merge_cells(f'F{start_row}:H{start_row}')
+                cell_f = ws.cell(row=start_row, column=6)
+                cell_f.font = HEADER_FONT
+                cell_f.alignment = CENTER_WRAP
+                cell_f.fill = HEADER_FILL
+                for col in range(6, 9):  # F=6, G=7, H=8
+                    ws.cell(row=start_row, column=col).border = Border(
+                        left=Side(style='medium'),
+                        right=Side(style='medium'),
+                        top=Side(style='medium'),  # ✅ top medium
+                        bottom=Side(style='thin')
+                    )
+                cell_f.value = '일'
+
+                # 2. 하단 헤더
+                sub_headers = ['', '', '목표', '수율', 'Gap', '목표', '수율', 'Gap']
+                for c_idx, h in enumerate(sub_headers, start_col):
+                    cell = ws.cell(row=start_row+1, column=c_idx)
+                    cell.font = HEADER_FONT
+                    cell.alignment = CENTER_WRAP
+                    cell.fill = HEADER_FILL
+                    cell.border = Border(left=Side(style='medium'), right=Side(style='medium'), top=Side(style='thin'), bottom=Side(style='thin'))
+                    cell.value = h  
+                    # 3. 데이터 행
+                    row_idx = 0
+                    last_row_num = None  # 마지막 행 저장용
+                    for yld_type in ['RTY', 'OAY']:
+                        # ✅ [수정] yld_type 마다 2 행씩 증가 (Total, Prime 각 1 행)
+                        main_cat_row = start_row + 2 + (row_idx * 2)
+                        
+                        # A 열 병합 (세로)
+                        ws.merge_cells(f'A{main_cat_row}:A{main_cat_row+1}')
+                        cell_main = ws.cell(row=main_cat_row, column=1)
+                        cell_main.value = f'WF {yld_type}'
+                        cell_main.font = Font(bold=True, size=9)
+                        cell_main.alignment = CENTER_WRAP
+                        cell_main.border = Border(left=Side(style='medium'), right=Side(style='medium'), top=Side(style='thin'), bottom=Side(style='thin'))
+                        
+                        for grade_idx, grade in enumerate(['Total', 'Prime']):
+                            row_num = main_cat_row + grade_idx
+                            data_row = table_df_3010[
+                                (table_df_3010['yld_type'] == yld_type) &
+                                (table_df_3010['grade'] == grade)
+                            ].iloc[0]
+                            grade_label = "Total(P+N)" if grade == 'Total' else "Prime"
+                            # B 열: 소분류
+                            cell_b = ws.cell(row=row_num, column=2, value=grade_label)
+                            cell_b.alignment = CENTER_WRAP
+                            cell_b.border = Border(left=Side(style='medium'), right=Side(style='medium'), top=Side(style='thin'), bottom=Side(style='thin'))
+                            
+                            # C\~H 열: 월/일 데이터
+                            # 월
+                            cell_c = ws.cell(row=row_num, column=3, value=data_row['monthly_plan'] / 100.0)
+                            cell_c.number_format = '0.00%'
+                            cell_c.font = Font(bold=False, size=9)
+                            cell_c.alignment = CENTER_WRAP
+                            cell_c.border = Border(left=Side(style='medium'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                            
+                            cell_d = ws.cell(row=row_num, column=4, value=data_row['monthly_actual'] / 100.0)
+                            cell_d.number_format = '0.00%'
+                            cell_d.font = Font(bold=False, size=9)
+                            cell_d.alignment = CENTER_WRAP
+                            cell_d.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                            
+                            cell_e = ws.cell(row=row_num, column=5, value=data_row['monthly_gap'] / 100.0)
+                            cell_e.number_format = '+0.00%;-0.00%;0.00%'
+                            cell_e.alignment = CENTER_WRAP
+                            cell_e.border = Border(left=Side(style='thin'), right=Side(style='medium'), top=Side(style='thin'), bottom=Side(style='thin'))
+                            if data_row['monthly_gap'] > 0:
+                                cell_e.font = Font(color="0000FF", bold=True, size=9)
+                            elif data_row['monthly_gap'] < 0:
+                                cell_e.font = Font(color="FF0000", bold=True, size=9)
+                            # 일
+                            cell_f = ws.cell(row=row_num, column=6, value=data_row['daily_plan'] / 100.0)
+                            cell_f.number_format = '0.00%'
+                            cell_f.font = Font(bold=False, size=9)
+                            cell_f.alignment = CENTER_WRAP
+                            cell_f.border = Border(left=Side(style='medium'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                            
+                            cell_g = ws.cell(row=row_num, column=7, value=data_row['daily_actual'] / 100.0)
+                            cell_g.number_format = '0.00%'
+                            cell_g.font = Font(bold=False, size=9)
+                            cell_g.alignment = CENTER_WRAP
+                            cell_g.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                            
+                            cell_h = ws.cell(row=row_num, column=8, value=data_row['daily_gap'] / 100.0)
+                            cell_h.number_format = '+0.00%;-0.00%;0.00%'
+                            cell_h.alignment = CENTER_WRAP
+                            cell_h.border = Border(left=Side(style='thin'), right=Side(style='medium'), top=Side(style='thin'), bottom=Side(style='thin'))
+                            if data_row['daily_gap'] > 0:
+                                cell_h.font = Font(color="0000FF", bold=True, size=9)
+                            elif data_row['daily_gap'] < 0:
+                                cell_h.font = Font(color="FF0000", bold=True, size=9)
+
+                        last_row_num = main_cat_row + 1  # 마지막 행 번호 저장 (Prime 행)
+                        row_idx += 1
+
+                    # ✅ 표의 맨 밑줄 (마지막 데이터 행) bottom 테두리 medium 적용
+                    if last_row_num is not None:
+                        for col in range(1, 9):  # A\~H 열
+                            cell = ws.cell(row=last_row_num, column=col)
+                            # 기존 border를 유지하면서 bottom만 medium으로
+                            current_border = cell.border
+                            cell.border = Border(
+                                left=current_border.left,
+                                right=current_border.right,
+                                top=current_border.top,
+                                bottom=Side(style='medium')  # ✅ bottom만 medium
+                            )
+
             else:
-                ws['H2'] = "표 없음"
-                ws['H2'].font = Font(size=10, color="FF0000")
-
-            # ──────────────────────────────────────────────────
-            # 2. [Prime 불량 목표 比 일실적 변동]
-            # ──────────────────────────────────────────────────
-            next_start_row = 20
-            data_3210_details = report.get('DATA_3210_wafering_300_details', {})
-            chart_path = data_3210_details.get('chart_path')
-
-            ws.merge_cells(f'A{next_start_row}:D{next_start_row}')
-            ws[f'A{next_start_row}'] = "[ Prime 불량 목표 比 일실적 변동 ]"
-            ws[f'A{next_start_row}'].font = Font(size=14, bold=True)
-            ws[f'A{next_start_row}'].alignment = Alignment(horizontal='left')
-
-            if not chart_path:
-                ws[f'A{next_start_row + 1}'] = "[차트 없음]"
-                ws[f'A{next_start_row + 1}'].font = Font(size=10, color="FF0000")
-            else:
-                chart_path = Path(chart_path)
-                if not chart_path.exists():
-                    ws[f'A{next_start_row + 1}'] = f"[파일 없음: {chart_path.name}]"
-                    ws[f'A{next_start_row + 1}'].font = Font(size=10, color="FF0000")
-                else:
-                    try:
-                        img = ExcelImage(str(chart_path))
-                        img.width = 600
-                        img.height = 350
-                        ws.add_image(img, f'A{next_start_row + 1}')
-                    except Exception as e:
-                        ws[f'A{next_start_row + 1}'] = f"[삽입 실패: {e}]"
-                        ws[f'A{next_start_row + 1}'].font = Font(size=10, color="FF0000")
-
-            # 요약 표 삽입 (G열)
-            table_df_for_row_height = None
-            if 'summary' in data_3210_details:
-                table_df = data_3210_details['summary'][['REJ_GROUP', 'GOAL_RATIO_PCT', 'LOSS_RATIO_PCT', 'GAP_PCT']].copy()
-                table_df.columns = ['구분', '목표(%)', '실적(%)', 'GAP(%)']
-                for col in ['목표(%)', '실적(%)', 'GAP(%)']:
-                    table_df[col] = table_df[col] / 100.0
-
-                table_df_for_row_height = table_df
-                start_row = next_start_row + 1
-                start_col = 8
-
-                for r_idx, row in enumerate(dataframe_to_rows(table_df, index=False, header=True), start_row):
-                    for c_idx, value in enumerate(row, start_col):
-                        cell = ws.cell(row=r_idx, column=c_idx, value=value)
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
-                        cell.font = Font(size=9)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        if r_idx == start_row:
-                            cell.font = Font(bold=True, size=9)
-                            cell.fill = PatternFill("solid", fgColor="D3D3D3")
-                        else:
-                            cell.number_format = '0.00%'
-                            if c_idx == start_col + 3:  # GAP 열
-                                try:
-                                    gap_val = float(value)
-                                    if gap_val > 0:
-                                        cell.fill = PatternFill("solid", fgColor="FFCCCC")
-                                        cell.font = Font(color="FF0000", bold=False, size=9)
-                                    elif gap_val < 0:
-                                        cell.fill = PatternFill("solid", fgColor="CCE5FF")
-                                        cell.font = Font(color="0000FF", bold=False, size=9)
-                                except:
-                                    pass
-
-                for row in range(start_row, start_row + len(table_df) + 1):
-                    ws.row_dimensions[row].height = 18
-
-
-            # ──────────────────────────────────────────────────
-            # 3. [Prime 주요 열위 불량 세부코드 분석]
-            # ──────────────────────────────────────────────────
-            row_start = next_start_row + 20
-            ws.merge_cells(f'A{row_start-1}:F{row_start-1}')
-            ws[f'A{row_start-1}'] = "[ Prime 주요 열위 불량 세부코드 분석 Ref.(3개월) 比 일실적 변동 (상위 3개) ]"
-            ws[f'A{row_start-1}'].font = Font(size=12, bold=True)
-            ws[f'A{row_start-1}'].alignment = Alignment(horizontal='left')
-
-            mid_analysis = report.get('DATA_3210_wafering_300_3months', {}).get('top3_midgroup_analysis', {})
-            plot_paths = mid_analysis.get('plot_paths', {})
-            group_tables = mid_analysis.get('tables', {})
-            detailed_analysis = data_3210_details.get('detailed_analysis', [])
-
-            # detailed_analysis 파싱
-            groups = []
-            current_group = None
-            current_code_dict = {}
-            for line in detailed_analysis:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                if stripped.startswith("[") and "분석" in stripped:
-                    if current_group and current_code_dict:
-                        groups.append((current_group, current_code_dict.copy()))
-                    current_group = stripped.strip("[]").replace(" 분석", "").strip()
-                    current_code_dict = {}
-                elif "열위 Lot" in stripped:
-                    parts = stripped.split(" 열위 Lot", 1)
-                    if len(parts) == 2:
-                        code = parts[0].strip()
-                        lot_info = parts[1].strip()
-                        if code not in current_code_dict:
-                            current_code_dict[code] = []
-                        current_code_dict[code].append(lot_info)
-                elif stripped.startswith("- "):
-                    content = stripped[2:].strip()
-                    if " " in content:
-                        code = content.split(" ", 1)[0].strip()
-                        lot_info = content[len(code):].strip()
-                        if code not in current_code_dict:
-                            current_code_dict[code] = []
-                        current_code_dict[code].append(lot_info)
-            if current_group and current_code_dict:
-                groups.append((current_group, current_code_dict))
-
-            formatted_analysis = []
-            for idx, (group_name, code_dict) in enumerate(groups):
-                formatted_analysis.append(f"{group_name} 분석")
-                for code, lot_list in code_dict.items():
-                    lot_str = ", ".join(lot_list)
-                    formatted_analysis.append(f"{code} 열위 Lot: {lot_str}")
-                if idx < len(groups) - 1:
-                    formatted_analysis.extend([""] * 3)
-
-            start_detail_row = row_start + 1
-            for i, line in enumerate(formatted_analysis):
-                ws.cell(row=start_detail_row + i, column=15, value=line).font = Font(size=10)
-
-            for rej_group, plot_path in plot_paths.items():
-                current_row = row_start
-                if not Path(plot_path).exists():
-                    ws.cell(row=current_row, column=1, value=f"{rej_group} 그래프 없음").font = Font(size=9, color="FF0000")
-                    row_start += 4
-                    continue
-
-                try:
-                    img = ExcelImage(plot_path)
-                    img.width = 400
-                    img.height = 200
-                    ws.add_image(img, f'A{current_row}')
-                except Exception as e:
-                    ws.cell(row=current_row, column=1, value=f"{rej_group} 삽입 실패: {e}").font = Font(size=9, color="FF0000")
-
-                group_num = None
-                for i, (g, _) in enumerate(groups):
-                    if rej_group.strip() in g.strip() or g.strip() in rej_group.strip():
-                        group_num = i + 1
-                        break
-                if group_num is None:
-                    group_lines = [f"  1) 분석 없음"]
-                else:
-                    group_key = f"{rej_group} 분석"
-                    group_lines = [line for line in formatted_analysis if line.startswith(f"{group_num}. {group_key}")]
-                for i, line in enumerate(group_lines):
-                    ws.cell(row=current_row + i, column=6, value=line).font = Font(size=9)
-
-                table_df = group_tables.get(rej_group)
-                if table_df is not None and not table_df.empty:
-                    headers = ['MID_GROUP', '실적(%)', 'Ref(3개월)', 'Gap']
-                    for c_idx, header in enumerate(headers, 8):
-                        cell = ws.cell(row=current_row, column=c_idx, value=header)
-                        cell.font = Font(bold=True, size=10)
-                        cell.fill = PatternFill("solid", fgColor="D3D3D3")
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
-
-                    table_df_fmt = table_df.copy()
-                    for col in ['실적(%)', 'Ref(3개월)', 'Gap']:
-                        if col in table_df_fmt.columns:
-                            table_df_fmt[col] = pd.to_numeric(table_df_fmt[col], errors='coerce') / 100.0
-
-                    for r_idx, row in enumerate(dataframe_to_rows(table_df_fmt, index=False, header=False), current_row + 1):
-                        for c_idx, value in enumerate(row, 8):
-                            cell = ws.cell(row=r_idx, column=c_idx, value=value)
-                            cell.font = Font(size=9)
-                            cell.alignment = Alignment(horizontal='center', vertical='center')
-                            cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                                top=Side(style='thin'), bottom=Side(style='thin'))
-                            if c_idx in [9,10,11]:
-                                cell.number_format = '0.00%'
-                            if c_idx == 11:
-                                try:
-                                    gap_val = float(value)
-                                    if gap_val > 0:
-                                        cell.fill = PatternFill("solid", fgColor="FFCCCC")
-                                        cell.font = Font(color="FF0000", bold=False, size=9)
-                                    elif gap_val < 0:
-                                        cell.fill = PatternFill("solid", fgColor="CCE5FF")
-                                        cell.font = Font(color="0000FF", bold=False, size=9)
-                                except:
-                                    pass
-                    table_height = len(table_df) + 1
-                else:
-                    ws.cell(row=current_row, column=8, value=f"{rej_group} 표 없음").font = Font(size=9, color="FF0000")
-                    table_height = 1
-
-                row_start = current_row + max(len(group_lines), table_height) + 5
-
+                ws.cell(row=2, column=8, value="표 없음").font = Font(size=10, color="FF0000")
 
             # ──────────────────────────────────────────────────
             # 4. [RC/HG 보상 영향성 분석] 섹션
             # ──────────────────────────────────────────────────
-            ws['A70'] = "[ RC/HG 보상 영향성 분석 ]"
-            ws['A70'].font = Font(size=12, bold=True)
-            ws['A70'].alignment = Alignment(horizontal='left')
+            title_cell = ws.cell(row=26, column=1, value="[ RC/HG 보상 영향성 분석(Ref. 3개월 比) ]")
+            title_cell.font = Font(size=12, bold=True)
+            title_cell.alignment = Alignment(horizontal='left')
 
             current_date = (datetime.now().date() - timedelta(days=1)).strftime("%Y%m%d")
             debug_dir = PROJECT_ROOT / "daily_reports_debug" / current_date
@@ -3058,7 +3446,7 @@ class DailyReportGenerator:
             loss_rate_table_total = data_lot_details.get('summary')  # 전체 표
             loss_rate_table_by_group = data_lot_details.get('loss_rate_table_by_group', {})  # 그룹별 표
 
-            current_row = 72
+            current_row = 28
             SECTION_HEIGHT = 9
 
             def safe_pct_to_float(x):
@@ -3104,12 +3492,12 @@ class DailyReportGenerator:
                     prefix = f" - {label} 보상률 {daily_rate:+.2f}%, Ref {ref_rate:+.2f}%, 比 "
 
                     # gap_val 기준으로 텍스트와 상태 결정
-                    if gap_val < 0:
-                        status = "열위"
-                        gap_color = "FF0000"  # 빨간색
-                    elif gap_val > 0:
+                    if gap_val > 0:
                         status = "양호"
-                        gap_color = "0000FF"  # 파란색
+                        gap_color = "0000FF"  # 빨간색 : FF0000, 파란색 : 0000FF
+                    elif gap_val < 0:
+                        status = "열위"
+                        gap_color = "FF0000"  # 파란색
                     else:
                         status = "변화없음"
                         gap_color = "000000"  # 검은색      
@@ -3122,10 +3510,8 @@ class DailyReportGenerator:
 
                     # B 열: Gap 값 (색상 적용)
                     ws[f'C{row_addr}'] = gap_text
-                    gap_color = "FF0000" if gap_val > 0 else "0000FF" if gap_val < 0 else "000000"
+                    gap_color = "0000FF" if gap_val > 0 else "FF0000" if gap_val < 0 else "000000"
                     ws[f'C{row_addr}'].font = Font(size=9, color=gap_color, bold=True)
-
-
                     return True
                 except Exception as e:
                     print(f"[ERROR] {label} 코멘트 생성 실패: {e}")
@@ -3141,27 +3527,33 @@ class DailyReportGenerator:
                 ws[f'A{comment_row}'].font = Font(size=10, bold=True)
 
                 if isinstance(loss_rate_table_total, pd.DataFrame) and not loss_rate_table_total.empty:
+                    fs_row = loss_rate_table_total[loss_rate_table_total['구분'] == 'FS']
                     resc_row = loss_rate_table_total[loss_rate_table_total['구분'] == 'RESC']
                     hg_row = loss_rate_table_total[loss_rate_table_total['구분'] == 'HG']
 
                     # 코멘트 시작 행
                     comment_row += 1
 
+                    # FS 처리
+                    if not resc_row.empty:
+                        create_group_comment(ws, comment_row, 'FS', fs_row)
+                        comment_row += 1
+                    else:
+                        ws[f'A{comment_row}'] = " - [FS 데이터 없음]"
+                        ws[f'A{comment_row}'].font = Font(size=9, color="808080")
+                        comment_row += 1
                     # RESC 처리
                     if not resc_row.empty:
                         create_group_comment(ws, comment_row, 'RC', resc_row)
                         comment_row += 1
-
                     else:
                         ws[f'A{comment_row}'] = " - [RESC 데이터 없음]"
                         ws[f'A{comment_row}'].font = Font(size=9, color="808080")
                         comment_row += 1
-
                     # HG 처리
                     if not hg_row.empty:
                         create_group_comment(ws, comment_row, 'HG', hg_row)
                         comment_row += 1
-
                     else:
                         ws[f'A{comment_row}'] = " - [HG 데이터 없음]"
                         ws[f'A{comment_row}'].font = Font(size=9, color="808080")
@@ -3171,7 +3563,7 @@ class DailyReportGenerator:
                 if total_chart_path.exists():
                     try:
                         img = ExcelImage(str(total_chart_path))
-                        img.width = 400
+                        img.width = 500
                         img.height = 200
                         ws.add_image(img, f'A{current_row+3}')
                     except Exception as e:
@@ -3185,7 +3577,7 @@ class DailyReportGenerator:
                 if isinstance(loss_rate_table_total, pd.DataFrame) and not loss_rate_table_total.empty:
                     headers = ['구분', 'Ref.(3개월)', '일', 'Ref.(3개월)%', '일%', 'Gap']
                     start_row = graph_row
-                    start_col = 8
+                    start_col = 7
 
                     for c_idx, header in enumerate(headers, start_col):
                         cell = ws.cell(row=start_row, column=c_idx, value=header)
@@ -3208,15 +3600,19 @@ class DailyReportGenerator:
                             cell.alignment = Alignment(horizontal='center', vertical='center')
                             cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
                                                 top=Side(style='thin'), bottom=Side(style='thin'))
-                            if c_idx in [11, 12, 13]:
+                            
+                            # Ref.(3 개월), 일은 #,### 형식
+                            if c_idx in [8, 9]:
+                                cell.number_format = '#,###'
+                            if c_idx in [10, 11, 12]:
                                 cell.number_format = '0.00%'
-                            if c_idx == 13:
+                            if c_idx == 12:
                                 try:
                                     gap_val = float(value)
-                                    if gap_val > 0:
-                                        cell.fill = PatternFill("solid", fgColor="FFCCCC")
-                                        cell.font = Font(color="FF0000", bold=False, size=9)
-                                    elif gap_val < 0:
+                                    if gap_val < 0:
+                                        cell.fill = PatternFill("solid", fgColor="FFCCCC") 
+                                        cell.font = Font(color="FF0000", bold=False, size=9) # 빨간색 : FF0000,FFCCCC 파란색 : 0000FF, CCE5FF
+                                    elif gap_val > 0:
                                         cell.fill = PatternFill("solid", fgColor="CCE5FF")
                                         cell.font = Font(color="0000FF", bold=False, size=9)
                                 except:
@@ -3225,240 +3621,471 @@ class DailyReportGenerator:
                     table_height = len(loss_rate_table_total) + 1                        
 
                 else:
-                    ws.cell(row=graph_row, column=8, value="[RC/HG 전체 표 없음]").font = Font(size=10, color="FF0000")
+                    ws.cell(row=graph_row, column=6, value="[RC/HG 전체 표 없음]").font = Font(size=10, color="FF0000")
                     table_height = 1
 
                 current_row = graph_row + 10
-
-            # ───────────────────────────────────────────────
-            # 2. 그룹별 그래프 + 코멘트 + 표 (PARTICLE, FLATNESS, WARP&BOW, NANO)
-            # ───────────────────────────────────────────────
-            for group_idx, group in enumerate(['PARTICLE', 'FLATNESS', 'WARP&BOW', 'NANO']):
-                chart_path = group_chart_paths[group]
-                table_data = loss_rate_table_by_group.get(group)
-                
-                # 그룹 제목
-                ws[f'A{current_row}'] = f"{group}"
-                ws[f'A{current_row}'].font = Font(size=10, bold=True)
-                comment_row = current_row + 1
-
-                # 그룹별 코멘트 (RESC, HG)
-                if isinstance(table_data, pd.DataFrame) and not table_data.empty:
-                    resc_row = table_data[table_data['구분'] == 'RESC']
-                    hg_row = table_data[table_data['구분'] == 'HG']
-
-                    if not resc_row.empty:
-                        create_group_comment(ws, comment_row, 'RC', resc_row)
-                        comment_row += 1
-                    else:
-                        ws[f'A{comment_row}'] = " - [RESC 데이터 없음]"
-                        ws[f'A{comment_row}'].font = Font(size=9, color="808080")
-                        comment_row += 1
-
-                    if not hg_row.empty:
-                        create_group_comment(ws, comment_row, 'HG', hg_row)
-                        comment_row += 1
-                    else:
-                        ws[f'A{comment_row}'] = " - [HG 데이터 없음]"
-                        ws[f'A{comment_row}'].font = Font(size=9, color="808080")
-                        comment_row += 1
-
-                # 그래프 삽입 (코멘트 아래)
-                graph_row = comment_row + 1
-                if chart_path.exists():
-                    try:
-                        img = ExcelImage(str(chart_path))
-                        img.width = 400
-                        img.height = 200
-                        ws.add_image(img, f'A{graph_row}')
-                    except Exception as e:
-                        ws[f'A{graph_row}'] = f"[RC/HG {group} 그래프 삽입 실패: {e}]"
-                        ws[f'A{graph_row}'].font = Font(size=10, color="FF0000")
-                else:
-                    ws[f'A{graph_row}'] = f"[{group} 그래프 파일 없음]"
-                    ws[f'A{graph_row}'].font = Font(size=10, color="FF0000")
-
-                # 표 삽입 (그래프 오른쪽, H 열부터)
-                if isinstance(table_data, pd.DataFrame) and not table_data.empty:
-                    headers = ['구분', 'Ref.(3 개월)', '일', 'Ref.(3개월)%', '일%', 'Gap']
-                    table_start_row = graph_row
-                    start_col = 8
-
-                    for c_idx, header in enumerate(headers, start_col):
-                        cell = ws.cell(row=table_start_row, column=c_idx, value=header)
-                        cell.font = Font(bold=True, size=10)
-                        cell.fill = PatternFill("solid", fgColor="D3D3D3")
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
-
-                    table_group_fmt = table_data.copy()
-                    for col in ['Ref.(3개월)%', '일%', 'Gap']:
-                        if col in table_group_fmt.columns:
-                            table_group_fmt[col] = table_group_fmt[col].apply(safe_pct_to_float)
-
-                    for r_idx, row in enumerate(dataframe_to_rows(table_group_fmt, index=False, header=False), table_start_row + 1):
-                        for c_idx, value in enumerate(row, start_col):
-                            cell = ws.cell(row=r_idx, column=c_idx, value=value)
-                            cell.font = Font(size=9)
-                            cell.alignment = Alignment(horizontal='center', vertical='center')
-                            cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                                top=Side(style='thin'), bottom=Side(style='thin'))
-                            if c_idx in [11, 12, 13]:
-                                cell.number_format = '0.00%'
-                            if c_idx == 13:
-                                try:
-                                    gap_val = float(value)
-                                    if gap_val > 0:
-                                        cell.fill = PatternFill("solid", fgColor="FFCCCC")
-                                        cell.font = Font(color="FF0000", bold=False, size=9)
-                                    elif gap_val < 0:
-                                        cell.fill = PatternFill("solid", fgColor="CCE5FF")
-                                        cell.font = Font(color="0000FF", bold=False, size=9)
-                                except:
-                                    pass
-
-                    table_height = len(table_data) + 1
-                else:
-                    ws.cell(row=graph_row, column=8, value=f"[{group} 표 없음]").font = Font(size=10, color="FF0000")
-                    table_height = 1
-
-                # 다음 그룹 시작 행 (그래프 높이 + 코멘트 + 표 + 여유)
-                current_row = graph_row + 10  # 그래프 높이 (200px ≈ 15 행) + 여유
-
 
             # ──────────────────────────────────────────────────
             # 5. [ 제품 영향성 분석 ] 섹션
             # ──────────────────────────────────────────────────
             current_row = current_row + 1
-            ws[f'A{current_row}'] = "[ 제품 영향성 분석 ]"
+            ws[f'A{current_row}'] = "[ 제품 영향성 분석(Ref. 6개월 比) ]"
             ws[f'A{current_row}'].font = Font(size=12, bold=True)
             current_row += 1
 
-            product_influence_gap = report.get('product_influence_gap')
-            top3_rej_groups = report.get('DATA_3210_wafering_300_details', {}).get('top3_rej_groups', [])
-            target_rej_groups = ['PARTICLE', 'FLATNESS', 'NANO', 'WARP&BOW', 'GROWING', 'SCRATCH', 'VISUAL', 'SAMPLE']
-            valid_rej_groups = [g for g in top3_rej_groups if g in target_rej_groups]
+            total_loss_gap = report.get('total_loss_gap')
 
-            if not isinstance(product_influence_gap, pd.DataFrame) or product_influence_gap.empty:
-                ws.cell(row=current_row, column=8, value="[제품 영향성 분석: 데이터 없음]").font = Font(size=10, color="FF0000")
-                current_row += 10
-            elif not valid_rej_groups:
-                ws.cell(row=current_row, column=8, value="[제품 영향성 분석: 대상 그룹 없음]").font = Font(size=10, color="FF0000")
+            if not isinstance(total_loss_gap, pd.DataFrame) or total_loss_gap.empty or 'PRODUCT_TYPE' not in total_loss_gap.columns:
+                ws.cell(row=current_row, column=1, value="[제품 영향성 분석: 데이터 없음]").font = Font(size=10, color="FF0000")
                 current_row += 10
             else:
-                rej_group = valid_rej_groups[0]
-                df_group = product_influence_gap[product_influence_gap['REJ_GROUP'] == rej_group]
+                display_df = total_loss_gap.rename(columns={'PRODUCT_TYPE': '제품',
+                                                            '물량비_GAP(%)' : 'Ref. 比 물량비 Gap',
+                                                            'Ref_전체_불량률(%)' : 'Ref_전체_불량률',
+                                                            'Daily_물량비(%)' : '일 물량비',
+                                                            'Ref_물량비(%)' : 'Ref_물량비'}).copy()
 
-                if df_group.empty:
-                    ws.cell(row=current_row, column=8, value=f"[{rej_group} 데이터 없음]").font = Font(size=10, color="FF0000")
-                    current_row += 10
-                else:
-                    chart1_path = debug_dir / f"{rej_group}_물량비_불량GAP_temp.png"
-                    try:
-                        fig1, ax1 = plt.subplots(figsize=(6, 4))
-                        x = [str(row['PRODUCT_TYPE']) for _, row in df_group.iterrows()]
-                        y = [float(pd.to_numeric(row['물량비_불량GAP'], errors='coerce')) for _, row in df_group.iterrows()]
-                        bars = ax1.bar(x, y, color='orange')
+                pct_columns = ['Ref_전체_불량률', '일 물량비', 'Ref_물량비', 'Ref. 比 물량비 Gap', '제품 Mix비 변동']
 
-                        ax1.set_title(f'{rej_group} 제품 Ref. 물량 비 불량 변동', fontsize=12, fontweight='bold')
-                        ax1.set_xlabel('제품', fontsize=10)
-                        ax1.set_ylabel('물량비_불량GAP', fontsize=10)
-                        ax1.tick_params(axis='x', rotation=0)
-                        ax1.grid(axis='y', linestyle='--', alpha=0.7)
+                for col in pct_columns:
+                    if col in display_df.columns:
+                        display_df[col] = display_df[col] / 100
 
-                        for i, (bar, val) in enumerate(zip(bars, y)):
+                # ──────────────────────────────────────────────────
+                # Total 코멘트 추가 (제목 바로 아래)
+                # ──────────────────────────────────────────────────
+                overall_stats = report.get('overall_stats', {})
+                total_val = overall_stats.get('total_volume_defect_change', 0.0)
+                total_val = total_val
+
+                # Total 코멘트 생성
+                total_comment = f"-. Total 제품 Mix 비 기인 변동 {total_val:+.2f}%"
+
+                ws[f'A{current_row}'] = total_comment
+                ws[f'A{current_row}'].font = Font(size=10, color="000000", bold=False)  
+                ws[f'A{current_row}'].alignment = Alignment(horizontal='left')
+                current_row += 1
+
+                # ──────────────────────────────────────────────────
+                # 제품별 코멘트 생성 (상위 3개 제품)
+                # ──────────────────────────────────────────────────
+                comment_row = current_row  # 코멘트는 그래프 전에 출력
+                for _, row in display_df.head(3).iterrows():
+                    pt = row['제품']
+                    gap_loss = row['제품 Mix비 변동']       # 0.01% → 0.01%p
+                    ref_ratio = row['Ref_물량비']           # 5.74%
+                    daily_ratio = row['일 물량비']          # 12.96%
+                    vol_gap = row['Ref. 比 물량비 Gap']     # 7.22%p
+
+                    # 물량비 불량 변동이 양수면 "열위", 음수면 "양호"
+                    impact = "열위" if gap_loss > 0 else "양호"
+
+                    # 코멘트 생성
+                    comment = (
+                        f"-. {pt} 제품 Mix비 기인 {gap_loss*100:+.2f}%p {impact}"
+                        f"(Ref. {ref_ratio*100:.2f}% -> {daily_ratio*100:.2f}%, "
+                        f"{vol_gap*100:+.2f}%p 물량 변동)"
+                    )
+
+                    ws[f'A{comment_row}'] = comment
+                    ws[f'A{comment_row}'].font = Font(size=10, color="000000", bold=False)
+                    ws[f'A{comment_row}'].alignment = Alignment(horizontal='left')
+                    comment_row += 1
+
+                current_row = comment_row + 1  # 코멘트 후 여백
+
+                # 전체 평균 행 추가
+                total_ref_qty = overall_stats.get('total_ref_qty', 0)
+                total_daily_qty = overall_stats.get('total_daily_qty', 0)
+                overall_ref_loss_rate = overall_stats.get('overall_ref_loss_rate', 0.0)
+                overall_daily_loss_rate = overall_stats.get('overall_daily_loss_rate', 0.0)
+                total_volume_defect_change = overall_stats.get('total_volume_defect_change', 0.0) #제품 Mix비 변동 전체 sum
+
+                # 첫 번째 그래프: 제품 Mix비 변동
+                chart1_path = debug_dir / "제품 Mix비 변동.png"
+                try:
+                    # Total 데이터 준비
+                    total_val = overall_stats.get('total_volume_defect_change', 0.0)
+                    total_val = total_val / 100 #%로 변경
+                    # display_df에서 제품명과 제품 Mix비 변동 추출
+                    x_labels = ['Total'] + [str(pt) for pt in display_df['제품']]
+                    y_values = [float(total_val)] + display_df['제품 Mix비 변동'].astype(float).tolist()
+
+                    # 색상 설정: 값이 양수면 빨간색, 음수면 파란색
+                    colors = ['#ff0000' if val >= 0 else '#0000ff' for val in y_values]
+
+                    # 그래프 생성
+                    fig1, ax1 = plt.subplots(figsize=(10, 6))  # 약간 넓게 조정 (Total 추가 고려)
+                    bars = ax1.bar(x_labels, y_values, color=colors)
+
+                    # Y축 범위 설정 (기존 방식 유지)
+                    y_min_val = min(y_values + [0])
+                    y_max_val = max(y_values + [0])
+                    y_range = y_max_val - y_min_val
+                    
+                    # 범위가 0 인 경우 방지
+                    if y_range == 0:
+                        y_range = 0.001  # 최소 범위 설정
+                    # Y축 상/하단 20% 여백 추가
+                    y_min = y_min_val - y_range * 0.2
+                    y_max = y_max_val + y_range * 0.2
+                    ax1.set_ylim(y_min, y_max)
+                    ax1.yaxis.set_major_formatter(PercentFormatter(1.0))  # 1.0 = 100%
+
+                    # 제목 및 레이블
+                    ax1.set_title("제품별 물량비 불량 변동 (Ref 기준)", fontsize=20, fontweight='bold')
+                    ax1.set_xlabel('제품', fontsize=14, fontweight='bold')
+                    ax1.set_ylabel('물량비 불량 변동', fontsize=14, fontweight='bold')
+                    ax1.tick_params(axis='x', rotation=0)
+                    ax1.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
+                    ax1.tick_params(axis='x', labelsize=20, rotation=0, pad=8)      # X축 눈금 글씨 크기
+                    ax1.tick_params(axis='y', labelsize=14, pad=8)                  # Y축 눈금 글씨 크기
+
+                    label_offset =  y_range * 0.05  # 동적 label_offset 설정 (Y축 범위의 5% 수준)
+
+                    for bar, val in zip(bars, y_values):
+                        height = bar.get_height()
+                        if val >= 0:
+                            pos_y = float(height + label_offset)
+                            va = 'bottom'
+                        else:
+                            pos_y = float(height - label_offset)
+                            va = 'top'
+                        label_text = f'{val * 100:+.2f}%'
+                        ax1.text(bar.get_x() + bar.get_width() / 2, pos_y,
+                                label_text, ha='center', va=va, fontsize=16, fontweight='bold', color='black')
+
+                    plt.tight_layout()
+                    plt.savefig(chart1_path, dpi=300, bbox_inches='tight')  # DPI 향상 (선명도 개선)
+                    plt.close()
+
+                    # Excel 삽입
+                    if chart1_path.exists():
+                        img1 = ExcelImage(str(chart1_path))
+                        img1.width = 500
+                        img1.height = 200
+                        ws.add_image(img1, f'A{current_row}')
+
+                except Exception as e:
+                    ws[f'A{current_row}'] = f"[그래프1 생성 실패: {e}]"
+                    ws[f'A{current_row}'].font = Font(size=10, color="FF0000")
+
+                # 두 번째 그래프: 물량비_GAP(%)
+                chart2_path = debug_dir / "제품_물량비_GAP.png"
+                try:
+                    # 데이터 준비
+                    products = display_df['제품'].tolist()
+                    ref_values = display_df['Ref_물량비'].astype(float).tolist()      # Ref 물량비
+                    daily_values = display_df['일 물량비'].astype(float).tolist()     # 일 물량비
+                    gap_values = [daily - ref for ref, daily in zip(ref_values, daily_values)]
+                    # ──────────────────────────────────────────────────
+                    # 전체 Y 축 범위 계산 (모든 제품 통합)
+                    # ──────────────────────────────────────────────────
+                    all_values = ref_values + daily_values  # 모든 값 통합
+                    global_min = min(all_values)
+                    global_max = max(all_values)
+
+                    # 여유 포함 (0 반드시 포함)
+                    y_min = min(0, global_min * 0.95)
+                    y_max = max(global_max * 1.15, 0.01)  # 최소 1% 확보
+                    y_range = y_max - y_min
+
+                    # 서브플롯 개수 (제품 수)
+                    n_products = len(products)
+
+                    # 3 개 서브플롯 생성 (가로로 나열)
+                    fig2, axes = plt.subplots(1, n_products, figsize=(5 * n_products, 4))
+                    
+                    # 단일 제품일 경우 axes 를 리스트로 변환
+                    if n_products == 1:
+                        axes = [axes]
+                    
+                    label_offset = y_range * 0.025  # 막대 값 라벨: 전체 높이의 2.5%
+                    gap_offset   = y_range * 0.06   # Gap 라벨: 전체 높이의 6% (더 멀리)
+
+                    for i, ax in enumerate(axes):
+                        # 데이터 추출
+                        ref_val = ref_values[i]
+                        daily_val = daily_values[i]
+                        gap_val = gap_values[i]
+                                        
+                        min_height = min(ref_val, daily_val)
+                        max_height = max(ref_val, daily_val)
+
+                        # 막대 그래프 생성 (x 위치: 0=Ref, 1=일)
+                        bars = ax.bar([0, 1], [ref_val, daily_val], color=['#0000ff', '#ff0000'])
+                        ax.set_ylim(y_min, y_max) #  Y 축 범위 통일 (모든 서브플롯 동일)
+                        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+                        
+                        # 제목 (제품명, 박스 없이 글만)
+                        ax.set_title(f"{products[i]}", fontsize=20, fontweight='bold', pad=10)
+                        
+                        # X 축 레이블
+                        ax.set_xticks([0, 1])
+                        ax.set_xticklabels(['Ref.', '일'], fontsize=14)
+                        ax.tick_params(axis='x', labelsize=14, rotation=0, pad=8)      # X축 눈금 글씨 크기
+                        ax.tick_params(axis='y', labelsize=14, pad=8)                  # Y축 눈금 글씨 크기
+
+                        # 그리드
+                        ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
+                        
+                        # 막대 위 라벨 
+                        for bar, val in zip(bars, [ref_val, daily_val]):
                             height = bar.get_height()
-                            # 음수는 아래, 양수는 위에 표시
-                            va = 'top' if val >= 0 else 'bottom'
-                            pos_y = height + (0.005 if val >= 0 else -0.005)
-                            ax1.text(bar.get_x() + bar.get_width() / 2, pos_y,
-                                    f'{val:+.2f}%', ha='center', va=va, fontsize=9, fontweight='bold', color='black')
+                            if val >= 0:
+                                pos_y = float(height + label_offset)
+                                va = 'bottom'
+                            else:
+                                pos_y = float(height - label_offset)
+                                va = 'top'
+                            ax.text(
+                                bar.get_x() + bar.get_width() / 2, 
+                                pos_y,
+                                f'{val*100:.2f}%', 
+                                ha='center', 
+                                va=va,
+                                fontsize=16, 
+                                fontweight='bold', 
+                                color='black',
+                                zorder=4
+                            )
+                        
+                        # Gap 라벨: 항상 max_height 기준 (음수여도 높은 막대 위에 표시)
+                        gap_y = max_height + gap_offset
+                        va_align = 'bottom'  # 항상 막대 위에 표시
 
-                        plt.tight_layout()
-                        plt.savefig(chart1_path, dpi=150, bbox_inches='tight')
-                        plt.close()
-                        if chart1_path.exists():
-                            img1 = ExcelImage(str(chart1_path))
-                            img1.width = 400
-                            img1.height = 200
-                            ws.add_image(img1, f'A{current_row}')
-                    except Exception as e:
-                        ws[f'A{current_row}'] = f"[그래프1 생성 실패: {e}]"
-                        ws[f'A{current_row}'].font = Font(size=10, color="FF0000")
+                        # Gap 라벨 (막대 사이 상단)
+                        gap_x = 0.5  # 두 막대 중간 위치
+                        gap_color = '#0000ff' if gap_val >= 0 else '#ff0000'  # +:파랑, -:빨강
+                        gap_text = f'{gap_val*100:+.2f}%'
+                        ax.text(gap_x, gap_y, gap_text, ha='center', va='bottom',
+                            fontsize=16, fontweight='bold', color=gap_color)
+                    
+                    plt.tight_layout()
+                    plt.savefig(chart2_path, dpi=300, bbox_inches='tight')  # DPI 향상 (선명도 개선)
+                    plt.close()
 
-                    chart2_path = debug_dir / f"{rej_group}_물량비_GAP_temp.png"
-                    try:
-                        fig2, ax2 = plt.subplots(figsize=(6, 4))
-                        x = [str(row['PRODUCT_TYPE']) for _, row in df_group.iterrows()]
-                        y = [float(pd.to_numeric(row['물량비_GAP(%)'], errors='coerce')) for _, row in df_group.iterrows()]
-                        bars = ax2.bar(x, y, color='orange')
+                    # Excel 삽입
+                    if chart2_path.exists():
+                        img2 = ExcelImage(str(chart2_path))
+                        img2.width = 500  
+                        img2.height = 200
+                        ws.add_image(img2, f'F{current_row}')
 
-                        ax2.set_title(f'{rej_group} 제품 Ref. 비 물량 변동', fontsize=12, fontweight='bold')
-                        ax2.set_xlabel('제품', fontsize=10)
-                        ax2.set_ylabel('물량비_GAP(%)', fontsize=10)
-                        ax2.tick_params(axis='x', rotation=0)
-                        ax2.grid(axis='y', linestyle='--', alpha=0.7)
+                except Exception as e:
+                    ws[f'F{current_row}'] = f"[그래프 2 생성 실패: {e}]"
+                    ws[f'F{current_row}'].font = Font(size=10, color="FF0000")
 
-                        for i, (bar, val) in enumerate(zip(bars, y)):
-                            height = bar.get_height()
-                            # 음수는 아래, 양수는 위에 표시
-                            va = 'top' if val >= 0 else 'bottom'
-                            pos_y = height + (0.005 if val >= 0 else -0.005)
-                            ax1.text(bar.get_x() + bar.get_width() / 2, pos_y,
-                                    f'{val:+.2f}%', ha='center', va=va, fontsize=9, fontweight='bold', color='black')
+                current_row += 11
 
-                        plt.tight_layout()
-                        plt.savefig(chart2_path, dpi=150, bbox_inches='tight')
-                        plt.close()
-                        if chart2_path.exists():
-                            img2 = ExcelImage(str(chart2_path))
-                            img2.width = 400
-                            img2.height = 200
-                            ws.add_image(img2, f'F{current_row}')
-                    except Exception as e:
-                        ws[f'F{current_row}'] = f"[그래프2 생성 실패: {e}]"
-                        ws[f'F{current_row}'].font = Font(size=10, color="FF0000")
+                # 표 삽입 
+                table_start_row = current_row
+                headers = ['제품', '제품 Mix비 변동', 'Ref_전체_불량률', 'Ref. 比 물량비 Gap', '일 물량비', 'Ref_물량비', '일 수량', 'Ref(6개월) 수량'] 
+                # 헤더 삽입
+                for c_idx, header in enumerate(headers, 1):
+                    cell = ws.cell(row=table_start_row, column=c_idx, value=header)
+                    cell.font = Font(bold=True, size=10)
+                    cell.fill = PatternFill("solid", fgColor="D3D3D3")
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                    cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                        top=Side(style='thin'), bottom=Side(style='thin'))
+                # 데이터 행 삽입 (상위 3개 제품)
+                for r_idx, row in display_df.iterrows():
+                    for c_idx, col in enumerate(headers, 1):
+                        value = ""
+                        if col == '제품':
+                            value = row['제품']
+                        elif col == 'Ref_전체_불량률':
+                            value = row['Ref_전체_불량률']
+                        elif col == 'Ref. 比 물량비 Gap':
+                            value = row['Ref. 比 물량비 Gap']
+                        elif col == '일 물량비':
+                            value = row['일 물량비']
+                        elif col == 'Ref_물량비':
+                            value = row['Ref_물량비']
+                        elif col == '제품 Mix비 변동':
+                            value = row['제품 Mix비 변동']
+                        elif col == '일 수량':
+                            value = row['Daily_Compile_수량']  # 정수
+                        elif col == 'Ref(6개월) 수량':
+                            value = row['Ref_Compile_수량']    # 정수
 
-                    table_start_row = 160
-                    headers = ['제품', 'Ref. 제품 불량률', '물량비 Gap', 'Ref.(6개월) 물량비', '일 물량비', 'Ref.(6개월) 수량', '일 수량']
-                    for c_idx, header in enumerate(headers, 1):
-                        cell = ws.cell(row=table_start_row, column=c_idx, value=header)
-                        cell.font = Font(bold=True, size=10)
-                        cell.fill = PatternFill("solid", fgColor="D3D3D3")
+                        cell = ws.cell(row=table_start_row + 1 + r_idx, column=c_idx, value=value)
+                        cell.font = Font(size=9)
                         cell.alignment = Alignment(horizontal='center', vertical='center')
                         cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
                                             top=Side(style='thin'), bottom=Side(style='thin'))
 
-                    table_data = []
-                    for _, row in df_group.iterrows():
-                        table_data.append({
-                            '제품': row['PRODUCT_TYPE'],
-                            'Ref. 제품 불량률': row['Ref_불량률(%)'],
-                            '물량비 Gap': row['물량비_GAP(%)'],
-                            'Ref.(6개월) 물량비': row['Ref_물량비(%)'],
-                            '일 물량비': row['Daily_물량비(%)'],
-                            'Ref.(6개월) 수량': row['Ref_Compile_수량'],
-                            '일 수량': row['Daily_Compile_수량']
-                        })
-                    table_df = pd.DataFrame(table_data, columns=headers)
+                        # number_format 적용
+                        if col in ['Ref_전체_불량률', 'Ref. 比 물량비 Gap', '제품 Mix비 변동']:
+                            cell.number_format = '+0.00%;-0.00%;0.00%'
+                        elif col in ['일 물량비', 'Ref_물량비']:
+                            cell.number_format = '0.00%'
+                        elif col in ['일 수량', 'Ref(6개월) 수량']:
+                            cell.number_format = '#,##0'
 
-                    table_df_fmt = table_df.copy()
-                    pct_columns = ['Ref. 제품 불량률', '물량비 Gap', 'Ref.(6개월) 물량비', '일 물량비']
-                    for col in pct_columns:
-                        if col in table_df_fmt.columns:
-                            table_df_fmt[col] = pd.to_numeric(table_df_fmt[col], errors='coerce') / 100.0
+                        # GAP 관련 채색
+                        if col in ['Ref. 比 물량비 Gap', '제품 Mix비 변동']:
+                            try:
+                                gap_val = float(value)
+                                if gap_val > 0:
+                                    cell.fill = PatternFill("solid", fgColor="FFCCCC")
+                                    cell.font = Font(color="FF0000", bold=False, size=9)
+                                elif gap_val < 0:
+                                    cell.fill = PatternFill("solid", fgColor="CCE5FF")
+                                    cell.font = Font(color="0000FF", bold=False, size=9)
+                            except:
+                                pass
 
-                    for r_idx, row in enumerate(dataframe_to_rows(table_df_fmt, index=False, header=False), table_start_row + 1):
-                        for c_idx, value in enumerate(row, 1):
-                            cell = ws.cell(row=r_idx, column=c_idx, value=value)
-                            cell.font = Font(size=9)
-                            cell.alignment = Alignment(horizontal='center', vertical='center')
-                            cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                                top=Side(style='thin'), bottom=Side(style='thin'))
-                            if c_idx in [2,3,4,7,8]:
-                                cell.number_format = '0.00%'
-                            if c_idx in [3,4]:
+                avg_row = table_start_row + len(total_loss_gap) + 1
+
+                # A 열: '전체 평균'
+                cell = ws.cell(row=avg_row, column=1, value='전체 평균')
+                cell.font = Font(bold=False, size=9)
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                    top=Side(style='thin'), bottom=Side(style='thin'))
+                
+                # B 열: 제품 Mix비 변동
+                cell = ws.cell(row=avg_row, column=2, value=total_volume_defect_change / 100)
+                cell.font = Font(bold=False, size=9)
+                cell.number_format = '+0.00%;-0.00%;0.00%'
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                    top=Side(style='thin'), bottom=Side(style='thin'))
+
+                # D 열: Ref_전체_불량률 (%)
+                cell = ws.cell(row=avg_row, column=3, value=overall_ref_loss_rate / 100.0)
+                cell.font = Font(size=9)
+                cell.number_format = '+0.00%;-0.00%;0.00%'
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                    top=Side(style='thin'), bottom=Side(style='thin'))
+
+                for c_idx in [4,5,6]:  
+                    cell = ws.cell(row=avg_row, column=c_idx, value="")
+                    cell.font = Font(size=9)  
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                    cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                        top=Side(style='thin'), bottom=Side(style='thin'))
+
+                # I 열: 일 수량
+                cell = ws.cell(row=avg_row, column=7, value=total_daily_qty)
+                cell.font = Font(size=9)
+                cell.number_format = '#,##0'
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                    top=Side(style='thin'), bottom=Side(style='thin'))
+
+                # J 열: Ref(6개월) 수량
+                cell = ws.cell(row=avg_row, column=8, value=total_ref_qty)
+                cell.font = Font(size=9)
+                cell.number_format = '#,##0'
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                    top=Side(style='thin'), bottom=Side(style='thin'))
+
+                # --- 표 아래에 계산식 설명 추가 ---
+                explanation_row = avg_row + 1  # 전체 평균 다음 행
+
+                cell = ws.cell(row=explanation_row, column=1, 
+                            value='※ 제품 Mix비 변동 = (Ref. 제품별 불량률 - Ref. 평균 불량률) × 물량변동비')
+                cell.font = Font(size=9, italic=True, color="555555")  # 작고, 이탤릭, 회색으로 시각적 차별
+                cell.alignment = Alignment(horizontal='left', vertical='center')
+                ws.row_dimensions[avg_row].height = 18
+
+                current_row = avg_row + 1
+
+            # ──────────────────────────────────────────────────
+            # 2. [Prime 불량 목표 比 일실적 변동]
+            # ──────────────────────────────────────────────────
+            next_start_row = 70
+            data_3210_details = report.get('DATA_3210_wafering_300_details', {})
+            chart_path = data_3210_details.get('chart_path')
+
+            ws.merge_cells(f'A{next_start_row}:D{next_start_row}')
+            ws[f'A{next_start_row}'] = "[ Prime 불량 목표 比 일실적 변동 ]"
+            ws[f'A{next_start_row}'].font = Font(size=14, bold=True)
+            ws[f'A{next_start_row}'].alignment = Alignment(horizontal='left')
+
+            # ──────────────────────────────────────────────────
+            # GAP 기준 상위 3개 불량에 대한 코멘트 생성 
+            # ──────────────────────────────────────────────────
+            comment_row = next_start_row + 1  # 제목 바로 아래
+            if 'summary' in data_3210_details:
+                summary_df = data_3210_details['summary'].copy()
+                
+                # GAP_PCT 기준 상위 3개
+                top3 = summary_df.nlargest(3, 'GAP_PCT')
+                
+                comment_parts = []
+                for _, row in top3.iterrows():
+                    rej = row['REJ_GROUP']
+                    loss_pct = row['LOSS_RATIO_PCT']   # % 단위
+                    gap_pct = row['GAP_PCT']          # %p 단위
+                    status = "미달" if gap_pct > 0 else "달성"
+                    comment_parts.append(f"{rej} {loss_pct:.2f}%({gap_pct:+.2f}%p {status})")
+                
+                if comment_parts:
+                    comment_text = "-. Prime 주요 불량 " + ", ".join(comment_parts)
+                    ws[f'A{comment_row}'] = comment_text
+                    ws[f'A{comment_row}'].font = Font(size=10, color="000000", bold=False)
+                    ws[f'A{comment_row}'].alignment = Alignment(horizontal='left')
+                    comment_row += 1
+                else:
+                    comment_row += 1
+            else:
+                comment_row += 1
+
+            # ──────────────────────────────────────────────────
+            # 그래프 삽입 (기존 위치 유지)
+            # ──────────────────────────────────────────────────
+            if not chart_path:
+                ws[f'A{comment_row}'] = "[차트 없음]"
+                ws[f'A{comment_row}'].font = Font(size=10, color="FF0000")
+            else:
+                chart_path = Path(chart_path)
+                if not chart_path.exists():
+                    ws[f'A{comment_row}'] = f"[파일 없음: {chart_path.name}]"
+                    ws[f'A{comment_row}'].font = Font(size=10, color="FF0000")
+                else:
+                    try:
+                        img = ExcelImage(str(chart_path))
+                        img.width = 600
+                        img.height = 300
+                        ws.add_image(img, f'A{comment_row}')
+                    except Exception as e:
+                        ws[f'A{comment_row}'] = f"[삽입 실패: {e}]"
+                        ws[f'A{comment_row}'].font = Font(size=10, color="FF0000")
+
+            # 요약 표 삽입 (G열)
+            table_df_for_row_height = None
+            summary_for_comment = None  
+            if 'summary' in data_3210_details:
+                table_df = data_3210_details['summary'][['REJ_GROUP', 'GOAL_RATIO_PCT', 'LOSS_RATIO_PCT', 'GAP_PCT']].copy()
+                table_df.columns = ['구분', '목표(%)', '실적(%)', 'GAP(%)']
+                for col in ['목표(%)', '실적(%)', 'GAP(%)']:
+                    table_df[col] = table_df[col] / 100.0
+
+                summary_for_comment = table_df
+                table_df_for_row_height = table_df
+                start_row = next_start_row + 1
+                start_col = 8
+
+                for r_idx, row in enumerate(dataframe_to_rows(table_df, index=False, header=True), start_row):
+                    for c_idx, value in enumerate(row, start_col):
+                        cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                            top=Side(style='thin'), bottom=Side(style='thin'))
+                        cell.font = Font(size=9)
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                        if r_idx == start_row:
+                            cell.font = Font(bold=True, size=9)
+                            cell.fill = PatternFill("solid", fgColor="D3D3D3")
+                        else:
+                            cell.number_format = '0.00%'
+                            if c_idx == start_col + 3:  # GAP 열
                                 try:
                                     gap_val = float(value)
                                     if gap_val > 0:
@@ -3470,16 +4097,276 @@ class DailyReportGenerator:
                                 except:
                                     pass
 
-                    for row in range(table_start_row, table_start_row + len(table_data) + 1):
-                        ws.row_dimensions[row].height = 18
+                for row in range(start_row, start_row + len(table_df) + 1):
+                    ws.row_dimensions[row].height = 18
 
-                    current_row = table_start_row + len(table_data) + 3
 
+            # ──────────────────────────────────────────────────
+            # 3. [Prime 주요 열위 불량 세부코드 분석]
+            # ──────────────────────────────────────────────────
+            row_start = next_start_row + 20
+            ws.merge_cells(f'A{row_start-1}:F{row_start-1}')
+            ws[f'A{row_start-1}'] = "[ Prime 주요 열위 불량 세부코드 분석 Ref.(3개월) 比 일실적 변동 (상위 3개) ]"
+            ws[f'A{row_start-1}'].font = Font(size=12, bold=True)
+            ws[f'A{row_start-1}'].alignment = Alignment(horizontal='left')
+
+            mid_analysis = report.get('DATA_3210_wafering_300_3months', {}).get('top3_midgroup_analysis', {})
+            plot_paths = mid_analysis.get('plot_paths', {})
+            group_tables = mid_analysis.get('tables', {})
+            detailed_analysis_dict = self.data.get('DATA_3210_wafering_300_3months', {}).get('top3_midgroup_analysis', {}).get('detailed_analysis', {})  # 딕셔너리
+
+            # ──────────────────────────────────────────────────
+            # 각 REJ_GROUP 별 코멘트 생성 함수
+            # ──────────────────────────────────────────────────
+            def create_midgroup_comment(rej_group, table_df, summary_df):
+                """
+                세부 코드별 코멘트 생성 (대분류 Total Gap 포함)
+                """
+                if table_df is None or table_df.empty:
+                    return None
+
+                # 1. 대분류 Total Gap 가져오기
+                total_gap = None
+                if summary_df is not None and '구분' in summary_df.columns:
+                    match_row = summary_df[summary_df['구분'] == rej_group]
+                    if not match_row.empty:
+                        total_gap = match_row.iloc[0]['GAP(%)']  # 소수 형태
+
+                # 2. Total Gap 코멘트 생성
+                total_comment = ""
+                if total_gap is not None:
+                    status = "미달" if total_gap > 0 else "초과" if total_gap < 0 else "동등"
+                    total_comment = f"{rej_group} 불량 Total {abs(total_gap * 100):.2f}%p {status}, "
+
+                # 3. 상위 3개 MID_GROUP 코멘트 생성
+                top3 = table_df.nlargest(3, 'Gap')
+                comment_parts = []
+                for _, row in top3.iterrows():
+                    mid = row['MID_GROUP']
+                    value = row['실적(%)']
+                    gap = row['Gap']
+                    status = "열위" if gap > 0 else "양호" if gap < 0 else "동등"
+                    comment_parts.append(f"{mid} {value:.2f}%(Ref. 比 {gap:+.2f}%p {status})")
+
+                # 4. 최종 코멘트 조합
+                if comment_parts:
+                    return f"-. {total_comment}" + ", ".join(comment_parts)
+                else:
+                    return f"-. {rej_group} 불량 Total {abs(total_gap * 100):.2f}%p {status}" if total_gap is not None else None
+
+            # ──────────────────────────────────────────────────
+            # 상세 분석 대상 그룹
+            # ──────────────────────────────────────────────────
+            target_groups = ['PARTICLE', 'FLATNESS', 'WARP&BOW', 'NANO']
+            current_row = row_start
+
+            # ──────────────────────────────────────────────────
+            # 각 REJ_GROUP 별로 그래프 + 코멘트 + 표 출력
+            # ──────────────────────────────────────────────────
+            for idx, rej_group in enumerate(plot_paths.keys()):
+
+                # 1. 코멘트 생성 및 출력 (그래프 위)
+                comment_text = create_midgroup_comment(rej_group, group_tables.get(rej_group), summary_for_comment)
+                if comment_text:
+                    ws[f'A{current_row}'] = comment_text
+                    ws[f'A{current_row}'].font = Font(size=10, color="000000", bold=False)
+                    ws[f'A{current_row}'].alignment = Alignment(horizontal='left')
+                    graph_row = current_row + 1
+                else:
+                    graph_row = current_row
+
+                # 2. 그래프 삽입
+                plot_path = plot_paths.get(rej_group)
+                if plot_path and Path(plot_path).exists():
+                    try:
+                        img = ExcelImage(plot_path)
+                        img.width = 500
+                        img.height = 200
+                        ws.add_image(img, f'A{graph_row}')
+                    except Exception as e:
+                        ws.cell(row=graph_row, column=1, value=f"{rej_group} 이미지 오류").font = Font(size=9)
+                else:
+                    ws.cell(row=graph_row, column=1, value=f"{rej_group}: 그래프 없음").font = Font(size=9)
+
+                # 3. 표 삽입
+
+                table_start_row = graph_row + 1 
+                table_df = group_tables.get(rej_group)
+                table_end_row = table_start_row + 1
+
+                if table_df is not None and not table_df.empty:
+                    headers = ['MID_GROUP', '실적(%)', 'Ref(3개월)', 'Gap']
+                    start_col = 7
+
+                    for c_idx, header in enumerate(headers, start_col):  #F열부터
+                        cell = ws.cell(row=table_start_row, column=c_idx, value=header)
+                        cell.font = Font(bold=True, size=10)
+                        cell.fill = PatternFill("solid", fgColor="D3D3D3")
+                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                            top=Side(style='thin'), bottom=Side(style='thin'))
+                        cell.alignment = Alignment(horizontal='center')
+
+                    table_df_fmt = table_df.copy()
+                    for col in ['실적(%)', 'Ref(3개월)', 'Gap']:
+                        if col in table_df_fmt.columns:
+                            table_df_fmt[col] = pd.to_numeric(table_df_fmt[col], errors='coerce') / 100.0
+
+                    for r_idx, row in enumerate(dataframe_to_rows(table_df_fmt, index=False, header=False), table_start_row + 1):
+                        for c_idx, value in enumerate(row, start_col):
+                            cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                            cell.font = Font(size=9)
+                            cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                                top=Side(style='thin'), bottom=Side(style='thin'))
+                            cell.alignment = Alignment(horizontal='center')
+                            if c_idx in [6,7]:
+                                cell.number_format = '#,##0'
+                            if c_idx in [8, 9, 10]:  # 퍼센트 컬럼
+                                cell.number_format = '0.00%'
+                            if c_idx == 10:  # Gap 컬럼
+                                try:
+                                    gap_val = float(value)
+                                    if gap_val > 0:
+                                        cell.fill = PatternFill("solid", fgColor="FFCCCC")
+                                        cell.font = Font(color="FF0000", size=9)
+                                    elif gap_val < 0:
+                                        cell.fill = PatternFill("solid", fgColor="CCE5FF")
+                                        cell.font = Font(color="0000FF", size=9)
+                                except:
+                                    pass
+                    table_end_row = table_start_row + len(table_df) + 1
+                else:
+                    ws.cell(row=graph_row, column=8, value="표 없음").font = Font(size=9)
+                # 4. 상세분석 텍스트 (M 열) - 표와 동일한 table_start_row 사용
+                analysis_lines = detailed_analysis_dict.get(rej_group, [])
+                analysis_col = 13  # M 열
+
+                # [1] 제목 셀 (단일 행)
+                title_cell = ws.cell(row=table_start_row, column=analysis_col, value=f"[{rej_group} 불량]")
+                title_cell.font = Font(size=9, bold=True, color="000000")
+                title_cell.alignment = Alignment(horizontal='left', vertical='center')
+
+                merge_start = table_start_row + 1
+                merge_end = max(merge_start + 4, table_end_row)  # 최소 5행, 표보다 짧으면 늘림
+                ws.merge_cells(f'M{merge_start}:M{merge_end}')
+
+                full_content = "\n".join(analysis_lines) if analysis_lines else "분석 없음"
+                content_cell = ws.cell(row=merge_start, column=analysis_col, value=full_content)
+                content_cell.font = Font(size=9)
+                content_cell.alignment = Alignment(wrap_text=True, horizontal='left', vertical='top')
+                ws.column_dimensions['M'].width = 50 # [5] L 열 너비 고정
+                # 5. 좌측 블록 끝 행 계산
+                left_block_end = max(graph_row + 10, table_end_row)
+                # ──────────────────────────────────────────────────
+                #  조건부 FS/HG/RESC 상세 분석 (기존 변수 사용)
+                # ──────────────────────────────────────────────────
+                next_row = left_block_end + 1  # 좌측 블록 아래 시작
+
+                if rej_group.upper() in target_groups:
+                    chart_path = group_chart_paths[rej_group]  
+                    table_data = loss_rate_table_by_group.get(rej_group)  
+
+                    # 그룹 제목
+                    ws[f'A{next_row}'] = f"{rej_group} (FS/HG/RESC 상세)"
+                    ws[f'A{next_row}'].font = Font(size=10, bold=True)
+                    comment_row = next_row + 1
+
+                    # 코멘트 (RESC, HG)
+                    if isinstance(table_data, pd.DataFrame) and not table_data.empty:
+                        resc_row = table_data[table_data['구분'] == 'RESC']
+                        hg_row = table_data[table_data['구분'] == 'HG']
+
+                        if not resc_row.empty:
+                            create_group_comment(ws, comment_row, 'RESC', resc_row)
+                            comment_row += 1
+                        else:
+                            ws[f'A{comment_row}'] = " - [RESC 데이터 없음]"
+                            ws[f'A{comment_row}'].font = Font(size=9, color="808080")
+                            comment_row += 1
+
+                        if not hg_row.empty:
+                            create_group_comment(ws, comment_row, 'HG', hg_row)
+                            comment_row += 1
+                        else:
+                            ws[f'A{comment_row}'] = " - [HG 데이터 없음]"
+                            ws[f'A{comment_row}'].font = Font(size=9, color="808080")
+                            comment_row += 1
+                    else:
+                        comment_row += 1
+
+                    # 그래프 삽입
+                    detail_graph_row = comment_row + 1
+                    if chart_path.exists():
+                        try:
+                            img = ExcelImage(str(chart_path))
+                            img.width = 500
+                            img.height = 200
+                            ws.add_image(img, f'A{detail_graph_row}')
+                        except Exception as e:
+                            ws[f'A{detail_graph_row}'] = f"[{rej_group} 그래프 삽입 실패]"
+                            ws[f'A{detail_graph_row}'].font = Font(size=9, color="FF0000")
+                    else:
+                        ws[f'A{detail_graph_row}'] = f"[{rej_group} 그래프 없음]"
+                        ws[f'A{detail_graph_row}'].font = Font(size=9, color="FF0000")
+
+                    # 표 삽입 (H열부터)
+                    detail_table_start_row = detail_graph_row
+                    detail_table_end_row = detail_table_start_row + 1
+                    if isinstance(table_data, pd.DataFrame) and not table_data.empty:
+                        headers = ['구분', 'Ref.(3개월)', '일', 'Ref.(3개월)%', '일%', 'Gap']
+                        start_col = 7
+                        for c_idx, header in enumerate(headers, start_col):
+                            cell = ws.cell(row=detail_table_start_row, column=c_idx, value=header)
+                            cell.font = Font(bold=True, size=10)
+                            cell.fill = PatternFill("solid", fgColor="D3D3D3")
+                            cell.alignment = Alignment(horizontal='center', vertical='center')
+                            cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                                top=Side(style='thin'), bottom=Side(style='thin'))
+
+                        table_group_fmt = table_data.copy()
+                        for col in ['Ref.(3개월)%', '일%', 'Gap']:
+                            if col in table_group_fmt.columns:
+                                table_group_fmt[col] = table_group_fmt[col].apply(safe_pct_to_float)
+
+                        for r_idx, row in enumerate(dataframe_to_rows(table_group_fmt, index=False, header=False), detail_table_start_row + 1):
+                            for c_idx, value in enumerate(row, start_col):
+                                cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                                cell.font = Font(size=9)
+                                cell.alignment = Alignment(horizontal='center', vertical='center')
+                                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                                    top=Side(style='thin'), bottom=Side(style='thin'))
+                                if c_idx in [8, 9]:
+                                    cell.number_format = '#,##0'
+                                if c_idx in [10, 11, 12]:
+                                    cell.number_format = '0.00%'
+                                if c_idx == 12:
+                                    try:
+                                        gap_val = float(value)
+                                        if gap_val > 0:
+                                            cell.fill = PatternFill("solid", fgColor="CCE5FF")
+                                            cell.font = Font(color="0000FF", bold=False, size=9)
+                                        elif gap_val < 0:
+                                            cell.fill = PatternFill("solid", fgColor="FFCCCC")
+                                            cell.font = Font(color="FF0000", bold=False, size=9)
+                                    except:
+                                        pass
+
+                        detail_table_end_row = detail_table_start_row + len(table_data) + 1
+                    else:
+                        ws.cell(row=detail_graph_row, column=8, value=f"[{rej_group} 표 없음]").font = Font(size=9, color="FF0000")
+
+                    # 다음 그룹 시작 위치: 상세 분석 블록 끝 + 1
+                    detail_block_end = max(detail_graph_row + 10, detail_table_end_row)
+                    current_row = detail_block_end
+                else:
+                    # 상세 분석 없으면 기존 위치 유지
+                    current_row = left_block_end
+
+                # current_row += 1
 
             # ──────────────────────────────────────────────────
             # 6. [장비별 불량률 GAP 분석]
             # ──────────────────────────────────────────────────
-            current_row = current_row + 5
+            current_row = current_row + 2
             ws[f'A{current_row}'] = "[장비별 불량률 GAP 분석]"
             ws[f'A{current_row}'].font = Font(size=12, bold=True)
             current_row += 2
@@ -3500,10 +4387,46 @@ class DailyReportGenerator:
             if not isinstance(waf_gap_data, dict):
                 waf_gap_data = {}
 
+            # 열 번호 → 문자 변환 함수 (get_column_letter 대체)
+            def col_num_to_letter(n):
+                if n <= 0:
+                    return 'A'
+                result = ''
+                while n > 0:
+                    n -= 1
+                    result = chr(65 + (n % 26)) + result
+                    n //= 26
+                return result
 
-            # top3_rej_groups = ['PIT', 'EDGE', 'VISUAL']
-            top3_rej_groups = report.get('DATA_3210_wafering_300_details', {}).get('top3_rej_groups', [])
-            valid_groups = [g for g in top3_rej_groups if g in ['PIT', 'SCRATCH', 'EDGE', 'BROKEN', 'CHIP', 'VISUAL']]
+            # top3_rej_groups = report.get('DATA_3210_wafering_300_details', {}).get('top3_rej_groups', [])
+            top3_rej_groups = ['BROKEN', 'EDGE', 'CHIP']  # 원본 그룹 리스트
+            expanded_groups = []
+            
+            for g in top3_rej_groups:
+                if g == 'BROKEN':
+                    # BROKEN → 4개 공정별 하위 그룹으로 확장
+                    expanded_groups.extend(['LAP_BROKEN', 'EP_BROKEN', 'DSP_BROKEN', 'FP_BROKEN'])
+                elif g == 'CHIP':
+                    # CHIP → 세부 유형으로 확장 (시각화에 사용되는 실제 키)
+                    expanded_groups.extend([
+                        'CHIP-LAP', 
+                        'EDGE-CHIP', 
+                        'CHIP_EG1AF', 
+                        'CHIP_EG1BF',
+                        'EDGE-ECHIP' 
+                    ])
+                else:
+                    # 그 외: SCRATCH, EDGE 등은 그대로 유지
+                    expanded_groups.append(g)
+
+            # waf_gap_data에 누락된 CHIP 그룹 추가 (빈 dict)
+            for group in expanded_groups:
+                if group not in waf_gap_data:
+                    if group in waf_ref_data and group in waf_daily_data:
+                        waf_gap_data[group] = {}
+
+            # valid_groups: waf_gap_data에 실제로 존재하는 그룹만 필터링
+            valid_groups = [g for g in expanded_groups if g in waf_gap_data]
 
             if not valid_groups:
                 ws[f'A{current_row}'] = "[WAF 분석: 상위 3개 그룹 중 대상 없음]"
@@ -3511,438 +4434,371 @@ class DailyReportGenerator:
                 current_row += 10
             else:
 
-                # ───────────────────────────────────────────────
-                # 0단계: 전체 GAP 값 수집 → Y축 통일을 위해
-                # ───────────────────────────────────────────────
-                all_gap_values = []
-                for rej_group in valid_groups:
-                    if rej_group not in waf_gap_data:
+                # 대분류 → 하위 그룹 매핑
+                MAIN_GROUPS = {
+                    'BROKEN': ['LAP_BROKEN', 'EP_BROKEN', 'DSP_BROKEN', 'FP_BROKEN'],
+                    'CHIP': ['CHIP-LAP', 'EDGE-CHIP', 'CHIP_EG1AF', 'CHIP_EG1BF', 'EDGE-ECHIP'],
+                    'EDGE': ['EDGE'],
+                    'SCRATCH': ['SCRATCH'],
+                    'PIT': ['PIT'],
+                    'VISUAL': ['VISUAL']
+                }
+
+                ALLOWED_GROUPS = ['PIT', 'SCRATCH', 'EDGE', 'BROKEN', 'CHIP', 'VISUAL']
+                valid_main_groups = [g for g in top3_rej_groups if g in ALLOWED_GROUPS]
+
+                # 대분류 중 유효한 것만 필터링
+                processed_main_groups = []
+                for main_group in valid_main_groups:
+                    if main_group not in MAIN_GROUPS:
                         continue
-                    gap_data = waf_gap_data[rej_group]
-                    if not gap_data:
+                    sub_groups = MAIN_GROUPS[main_group]
+                    if any(sg in valid_groups for sg in sub_groups):
+                        processed_main_groups.append(main_group)
+
+                for main_group in processed_main_groups:
+                    # ───────────────────────────────────────────────
+                    # 1단계: 해당 대분류의 모든 하위 그룹 gap_data 통합
+                    # ───────────────────────────────────────────────
+                    all_gap_data = {}
+                    all_ref_data = {}
+                    all_daily_data = {}
+
+                    if main_group in ['BROKEN', 'CHIP']:
+                        sub_groups = MAIN_GROUPS[main_group]
+                        for sg in sub_groups:
+                            if sg in valid_groups:
+                                gap_data_sg = waf_gap_data.get(sg, {})
+                                if isinstance(gap_data_sg, dict):
+                                    all_gap_data.update(gap_data_sg)
+                                all_ref_data.update(waf_ref_data.get(sg, {}))
+                                all_daily_data.update(waf_daily_data.get(sg, {}))
+                    else:
+                        # EDGE 등 단일 그룹
+                        all_gap_data = waf_gap_data.get(main_group, {})
+                        all_ref_data = waf_ref_data.get(main_group, {})
+                        all_daily_data = waf_daily_data.get(main_group, {})
+
+                    if not all_gap_data:
+                        print(f"[WARNING] {main_group}: 통합 gap_data 없음")
+                        ws[f'A{current_row}'] = f"[{main_group}: 분석 데이터 없음]"
+                        ws[f'A{current_row}'].font = Font(size=10, color="FF0000")
+                        current_row += 10
                         continue
 
-                    if isinstance(gap_data, dict) and isinstance(next(iter(gap_data.values()), {}), dict):
-                        sorted_eqps = sorted(
-                            gap_data.items(),
-                            key=lambda x: abs(sum(v for v in x[1].values())),
-                            reverse=True
-                        )[:3]
-
-                        for eqp_col, rates in sorted_eqps:
-                            if not rates:
-                                continue
+                    # ───────────────────────────────────────────────
+                    # 2단계: Y축 통일을 위한 GAP 값 수집
+                    # ───────────────────────────────────────────────
+                    all_gap_values = []
+                    if isinstance(all_gap_data, dict) and isinstance(next(iter(all_gap_data.values()), {}), dict):
+                        for eqp_col, rates in all_gap_data.items():
+                            if not rates: continue
                             for val in rates.values():
                                 all_gap_values.append(val)
-                    
+
+                    if all_gap_values:
+                        global_min = min(all_gap_values)
+                        global_max = max(all_gap_values)
+                        margin = max(0.0001, abs(global_max - global_min) * 0.2)
+                        y_min = global_min - margin
+                        y_max = global_max + margin
+                        if y_min > 0: y_min = -margin
+                        if y_max < 0: y_max = margin
                     else:
-                      print(f"[WARNING] {rej_group}: gap_data 구조 오류 - {type(gap_data)}")
-
-                # 전체 min/max 계산
-                if all_gap_values:
-                    global_min = min(all_gap_values)
-                    global_max = max(all_gap_values)
-                    margin = max(0.0001, abs(global_max - global_min) * 0.2)
-                    y_min = global_min - margin
-                    y_max = global_max + margin
-
-                    # 0 포함 보장
-                    if y_min > 0:
-                        y_min = -margin
-                    if y_max < 0:
-                        y_max = margin
-                else:
-                    y_min, y_max = -0.0005, 0.0005  # 기본값
-
-                # ───────────────────────────────────────────────
-                # 1단계: 그래프 생성 및 가로 배치 (최대 3개/행)
-                # ───────────────────────────────────────────────
-                graph_start_row = current_row
-                current_graph_row = graph_start_row
-                graphs_in_row = 0  # 현재 행에 삽입된 그래프 수 (0\~3)
-                current_defect_group = None  # 현재 불량 그룹 추적
-                graphs_created = 0  # 생성된 그래프 수 추적
-
-                # 열 번호 → 문자 변환 함수 (get_column_letter 대체)
-                def col_num_to_letter(n):
-                    if n <= 0:
-                        return 'A'
-                    result = ''
-                    while n > 0:
-                        n -= 1
-                        result = chr(65 + (n % 26)) + result
-                        n //= 26
-                    return result
-
-                for rej_group in valid_groups:
-                    if rej_group not in waf_gap_data:
-                        print(f"[WARNING] {rej_group}: waf_gap_data 에 없음")
-                        # 데이터 없으면 메시지 표시 (선택사항)
-                        ws[f'A{current_graph_row}'] = f"[{rej_group}: 분석 데이터 없음]"
-                        ws[f'A{current_graph_row}'].font = Font(size=10, color="FF0000")
-                        current_graph_row += 2
-                        continue
-                    gap_data = waf_gap_data[rej_group]
-                    if not gap_data:
-                        print(f"[WARNING] {rej_group}: gap_data 가 비어있음")
-                        ws[f'A{current_graph_row}'] = f"[{rej_group}: 분석 데이터 없음]"
-                        ws[f'A{current_graph_row}'].font = Font(size=10, color="FF0000")
-                        current_graph_row += 2
-                        continue
-
-                    # 불량 그룹이 바뀌면 무조건 다음 행으로
-                    if current_defect_group is not None and rej_group != current_defect_group:
-                        if graphs_in_row > 0:
-                            current_graph_row += 10
-                            graphs_in_row = 0
-                    
-                    current_defect_group = rej_group
+                        y_min, y_max = -0.0005, 0.0005
 
                     # ───────────────────────────────────────────────
-                    # 모든 그룹을 중첩 dict 구조로 통일 처리
-                    # → VISUAL, PIT, SCRATCH 등 모두 동일하게 처리
+                    # 3단계: 그래프 생성 (소분류 기준)
                     # ───────────────────────────────────────────────
+                    graph_start_row = current_row
+                    current_graph_row = graph_start_row
+                    graphs_in_row = 0
 
-                    if isinstance(gap_data, dict) and isinstance(next(iter(gap_data.values()), {}), dict):
-                        sorted_eqps = sorted(gap_data.items(), key=lambda x: abs(sum(v for v in x[1].values())), reverse=True)[:3]
+                    # 소분류별로 그래프 생성
+                    for sub_group in sub_groups:
+                        if sub_group not in valid_groups:
+                            continue
+                        
+                        gap_data_sg = waf_gap_data.get(sub_group, {})
+                        ref_data_sg = waf_ref_data.get(sub_group, {})      
+                        daily_data_sg = waf_daily_data.get(sub_group, {})  
 
-                        for eqp_col, rates in sorted_eqps:
-                            # 공정명 추출 (예: 3670)
-                            proc = eqp_col[-4:] if eqp_col[-4:].isdigit() else eqp_col
+                        if isinstance(next(iter(gap_data_sg.values()), {}), dict):
+                            eqp_list = []
+                            for eqp_col, rates in gap_data_sg.items():
+                                proc_match = re.search(r'(\d{4})', eqp_col)
+                                proc = int(proc_match.group(1)) if proc_match else 9999
+                                if rates:
+                                    eqp_list.append({'eqp_col': eqp_col, 'proc': proc, 'rates': rates})
 
-                            # 빈 데이터 체크
-                            if not rates:
-                                continue
+                            sorted_eqp_list = sorted(eqp_list, key=lambda x: x['proc'])
+                            top3_eqp_list = sorted_eqp_list[:3]
 
-                            # 그래프 파일 경로
-                            safe_rej = "".join(c if c.isalnum() else "_" for c in rej_group)
-                            safe_eqp = "".join(c if c.isalnum() else "_" for c in proc)
-                            chart_path = debug_dir / f"WAF_{safe_rej}_{safe_eqp}_gap_chart.png"
-                            
-                            # 기존 파일 있으면 삭제
-                            if chart_path.exists():
-                                chart_path.unlink()
-                                print(f"[INFO] 기존 파일 삭제: {chart_path}")
+                            for item in top3_eqp_list:
+                                eqp_col = item['eqp_col']
+                                proc = str(item['proc'])
+                                rates = item['rates']
 
-                            try:
-                                fig, ax = plt.subplots(figsize=(6, 4))
-                                sorted_rates = sorted(rates.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
-                                labels = [k for k, v in sorted_rates]
-                                values = [v for k, v in sorted_rates]  # 0.0144 소수
-                                colors = ['orange' if v > 0 else 'steelblue' if v < 0 else 'gray' for v in values]
+                                if not rates: continue
 
-                                ax.bar(labels, values, color=colors, width=0.6)
-                                ax.set_title(f'{rej_group} - 공정 {proc}', fontsize=12, fontweight='bold')
-                                ax.set_ylabel('GAP (%)', fontsize=10)
-                                ax.set_xlabel('장비', fontsize=10)
-                                ax.tick_params(axis='x', rotation=0)
-                                ax.grid(axis='y', linestyle='--', alpha=0.7)
-
-                                # Y축 범위
-                                ax.set_ylim(y_min, y_max)
-                                ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
-
-                                # 값 표시
-                                for i, (label, val) in enumerate(zip(labels, values)):
-                                    ax.text(i, val + (margin * 0.1 if val >= 0 else -margin * 0.1),
-                                            f"{val * 100 :+.2f}%", ha='center', va='bottom' if val >= 0 else 'top',
-                                            fontsize=9, fontweight='bold', color='black')
-
-                                plt.tight_layout()
-                                plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-                                plt.close()
-
+                                # 그래프 제목에 소분류 사용
+                                safe_rej = "".join(c if c.isalnum() else "_" for c in sub_group)
+                                safe_eqp = "".join(c if c.isalnum() else "_" for c in proc)
+                                chart_path = debug_dir / f"WAF_{safe_rej}_{safe_eqp}_gap_chart.png"
+                                
                                 if chart_path.exists():
-                                    img = ExcelImage(str(chart_path))
-                                    img.width = 400
-                                    img.height = 200
+                                    chart_path.unlink()
 
-                                    # 3개 초과 시 다음 행으로
-                                    if graphs_in_row >= 3:
-                                        current_graph_row += 10  # 다음 행 (10행 간격)
-                                        graphs_in_row = 0
+                                try:
+                                    fig, ax = plt.subplots(figsize=(10, 6))
+                                    sorted_rates = sorted(rates.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+                                    equipment_names = [eqp for eqp, _ in sorted_rates]
 
-                                    col_offset = graphs_in_row * 5  # 0→0, 1→5, 2→10
-                                    col_letter = col_num_to_letter(1 + col_offset)  # A, G, M
-                                    ws.add_image(img, f'{col_letter}{current_graph_row}')
-                                    graphs_in_row += 1
+                                    # Ref와 Daily 값 가져오기 (기존 ref_data_sg, daily_data_sg 사용)
+                                    ref_values = []
+                                    daily_values = []
+                                    gap_values = []
+                                    for eqp_name, gap_val in sorted_rates:
+                                        # Ref 데이터
+                                        level1 = ref_data_sg.get(eqp_col, {})
+                                        ref_eqp_data = level1.get(eqp_name, {}) if isinstance(level1, dict) else ref_data_sg.get(eqp_name, {})
+                                        ref_rate_val = ref_eqp_data.get('rate', 0.0)
 
-                                else:
-                                    col_offset = graphs_in_row * 5
-                                    col_letter = col_num_to_letter(1 + col_offset)
-                                    ws[f'{col_letter}{current_graph_row}'] = f"[{rej_group}-{proc} 파일 없음]"
-                                    graphs_in_row += 1
+                                        # Daily 데이터
+                                        level1_daily = daily_data_sg.get(eqp_col, {})
+                                        daily_eqp_data = level1_daily.get(eqp_name, {}) if isinstance(level1_daily, dict) else daily_data_sg.get(eqp_name, {})
+                                        daily_rate_val = daily_eqp_data.get('rate', 0.0)
 
-                            except Exception as e:
-                                col_offset = graphs_in_row * 5
-                                col_letter = col_num_to_letter(1 + col_offset)
-                                ws[f'{col_letter}{current_graph_row}'] = f"[{rej_group}-{proc} 실패]"
-                                ws[f'{col_letter}{current_graph_row}'].font = Font(size=9, color="FF0000")
-                                graphs_in_row += 1
-                    else:
-                        print(f"[WARNING] {rej_group}: gap_data 구조 오류 - {type(gap_data)}")
+                                        ref_values.append(float(ref_rate_val))
+                                        daily_values.append(float(daily_rate_val))
+                                        gap_values.append(float(gap_val))
 
-                # 그래프가 하나도 없으면 메시지
-                if graphs_created == 0:
-                    ws[f'A{current_graph_row}'] = "[분석할 그래프 데이터 없음]"
-                    ws[f'A{current_graph_row}'].font = Font(size=10, color="FF0000")
-                    current_graph_row += 2
+                                    # ✅ 장비 수만큼 서브플롯 생성 (가로로 나열)
+                                    n_eqps = len(equipment_names)
+                                    fig, axes = plt.subplots(1, n_eqps, figsize=(5 * n_eqps, 4))
+                                    
+                                    # 단일 장비일 경우 axes 를 리스트로 변환
+                                    if n_eqps == 1:
+                                        axes = [axes]
+                                    
+                                    for i, ax in enumerate(axes):
+                                        # 데이터 추출
+                                        ref_val = ref_values[i]
+                                        daily_val = daily_values[i]
+                                        gap_val = gap_values[i]
+                                        eqp_name = equipment_names[i]
+                                        
+                                        # ✅ 막대 그래프 생성 (x 위치: 0=Ref, 1=일)
+                                        bars = ax.bar([0, 1], [ref_val, daily_val], color=['#0000ff', '#ff0000'])
+                                        
+                                        # ✅ Y 축 범위 설정 (여유 포함, 0 포함)
+                                        all_vals = [ref_val, daily_val, 0]
+                                        y_min = min(all_vals) * 0.95 if min(all_vals) <= 0 else 0
+                                        y_max = max(all_vals) * 1.15 if max(all_vals) >= 0 else 0
+                                        if y_min == y_max:
+                                            y_min, y_max = -0.1, 0.1
+                                        ax.set_ylim(y_min, y_max)
+                                        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+                                        
+                                        # ✅ 제목 (장비명, 박스 없이 글만)
+                                        ax.set_title(f"{eqp_name}", fontsize=14, fontweight='bold', pad=10)
+                                        
+                                        # ✅ X 축 레이블
+                                        ax.set_xticks([0, 1])
+                                        ax.set_xticklabels(['Ref.', '일'], fontsize=14)
+                                        
+                                        # ✅ 그리드
+                                        ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
+                                        
+                                        # ✅ 막대 위 라벨
+                                        for bar, val in zip(bars, [ref_val, daily_val]):
+                                            height = bar.get_height()
+                                            ax.text(bar.get_x() + bar.get_width() / 2, height,
+                                                f'{val*100:.2f}%', ha='center', va='bottom',
+                                                fontsize=14, fontweight='bold', color='black')
+                                        
+                                        # ✅ Gap 라벨 (막대 사이 상단)
+                                        gap_x = 0.5  # 두 막대 중간 위치
+                                        gap_y = max(ref_val, daily_val) * 1.05  # 높은 막대 위에 표시
+                                        gap_color = '#ff0000' if gap_val >= 0 else '#0000ff'  # +:빨강, -:파랑 (표와 동일)
+                                        gap_text = f'{gap_val*100:+.2f}%'
+                                        ax.text(gap_x, gap_y, gap_text, ha='center', va='bottom',
+                                            fontsize=14, fontweight='bold', color=gap_color)
+                                    
+                                    # ✅ 전체 제목 (소분류 - 공정)
+                                    fig.suptitle(f'{sub_group} - 공정 {proc}', fontsize=14, fontweight='bold', y=1.02)
+                                    
+                                    plt.tight_layout()
+                                    plt.savefig(chart_path, dpi=300, bbox_inches='tight')
+                                    plt.close()
 
-                # ───────────────────────────────────────────────
-                # 2 단계: 모든 그래프 아래에 통합 표 생성 (A 열부터)
-                # ───────────────────────────────────────────────
-                table_start_row = current_graph_row  + 10  # 그래프 아래 여유 공간
+                                    # ✅ Excel 삽입 (기존 로직 유지)
+                                    if chart_path.exists():
+                                        img = ExcelImage(str(chart_path))
+                                        img.width = 400
+                                        img.height = 200
 
-                # 헤더
-                headers = ['불량','구분', '장비', 'Ref.(3 개월)', '일', 'Ref.(3 개월)', '일', 'Gap']
-                for c_idx, header in enumerate(headers, 1):  # A 열부터 (1)
-                    cell = ws.cell(row=table_start_row, column=c_idx, value=header)
-                    cell.font = Font(bold=True, size=9)
-                    cell.fill = PatternFill("solid", fgColor="D3D3D3")
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                    cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                        top=Side(style='thin'), bottom=Side(style='thin'))
+                                        if graphs_in_row >= 3:
+                                            current_graph_row += 10
+                                            graphs_in_row = 0
 
-                # 데이터 수집 (모든 그룹/공정 통합)
-                all_table_rows = []
-                for rej_group in valid_groups:
-                    if rej_group not in waf_gap_data:
-                        continue
-                    gap_data = waf_gap_data[rej_group]
-                    if not gap_data:
-                        continue
+                                        col_offset = graphs_in_row * 5
+                                        col_letter = col_num_to_letter(1 + col_offset)
+                                        ws.add_image(img, f'{col_letter}{current_graph_row}')
+                                        graphs_in_row += 1
 
-                    # ref_dict 추출 + 강제 dict 보정
-                    ref_dict_raw = waf_ref_data.get(rej_group)
-                    if not isinstance(ref_dict_raw, dict):
-                        print(f"[WARNING] ref_dict for {rej_group} is not dict: {type(ref_dict_raw)} → 빈 dict")
-                        ref_dict_raw = {}
+                                except Exception as e:
+                                    print(f"[ERROR] 그래프 생성 실패: {sub_group}-{proc} | {e}")
 
-                    daily_dict_raw = waf_daily_data.get(rej_group, {})
-                    if not isinstance(daily_dict_raw, dict):
-                        print(f"[WARNING] daily_dict for {rej_group} is not dict: {type(daily_dict_raw)} → 빈 dict")
-                        daily_dict_raw = {}
+                    # 그래프 다음 행 계산
+                    next_row_after_graph = current_graph_row + (10 if graphs_in_row > 0 else 0)
 
-                    if isinstance(gap_data, dict) and isinstance(next(iter(gap_data.values()), {}), dict):
-                        for eqp_col, rates in gap_data.items():
-                            # 공정 코드 추출
-                            proc = eqp_col[-4:] if eqp_col[-4:].isdigit() else eqp_col
+                    # ───────────────────────────────────────────────
+                    # 4단계: 통합 표 생성
+                    # ───────────────────────────────────────────────
+                    table_start_row = next_row_after_graph + 1
 
-                            if not rates:
-                                continue
+                    headers = ['불량','구분', '장비', 'Ref.(3개월)', '일', 'Ref.(3개월)', '일', 'Gap']
+                    for c_idx, header in enumerate(headers, 1):
+                        cell = ws.cell(row=table_start_row, column=c_idx, value=header)
+                        cell.font = Font(bold=True, size=9)
+                        cell.fill = PatternFill("solid", fgColor="D3D3D3")
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                            top=Side(style='thin'), bottom=Side(style='thin'))
 
-                            eqp_rows = []
-                            for eqp_name in rates.keys():
-                                # ref: ref_dict_raw[eqp_col][eqp_name]
-                                level1 = ref_dict_raw.get(eqp_col)
-                                if isinstance(level1, dict):
-                                    ref_eqp_data = level1.get(eqp_name, {})
-                                else:
-                                    ref_eqp_data = ref_dict_raw.get(eqp_name, {})  # fallback
+                    # 데이터 수집 (소분류 기준)
+                    table_rows = []
+                    for sub_group in sub_groups:
+                        if sub_group not in valid_groups:
+                            continue
+                        
+                        gap_data_sg = waf_gap_data.get(sub_group, {})
+                        ref_data_sg = waf_ref_data.get(sub_group, {})
+                        daily_data_sg = waf_daily_data.get(sub_group, {})
+                        
+                        if not isinstance(gap_data_sg, dict):
+                            continue
 
-                                if isinstance(ref_eqp_data, dict):
+                        if isinstance(next(iter(gap_data_sg.values()), {}), dict):
+                            for eqp_col, rates in gap_data_sg.items():
+                                proc = eqp_col[-4:] if eqp_col[-4:].isdigit() else eqp_col
+                                if not rates: continue
+
+                                eqp_rows = []
+                                for eqp_name in rates.keys():
+                                    level1 = ref_data_sg.get(eqp_col)
+                                    ref_eqp_data = level1.get(eqp_name, {}) if isinstance(level1, dict) else ref_data_sg.get(eqp_name, {})
                                     ref_count = ref_eqp_data.get('count', 0)
                                     ref_rate_val = ref_eqp_data.get('rate', 0.0)
-                                else:
-                                    ref_count = 0
-                                    ref_rate_val = 0.0
 
-                                # daily
-                                level1_daily = daily_dict_raw.get(eqp_col)
-                                if isinstance(level1_daily, dict):
-                                    daily_eqp_data = level1_daily.get(eqp_name, {})
-                                else:
-                                    daily_eqp_data = daily_dict_raw.get(eqp_name, {})
-
-                                if isinstance(daily_eqp_data, dict):
+                                    level1_daily = daily_data_sg.get(eqp_col)
+                                    daily_eqp_data = level1_daily.get(eqp_name, {}) if isinstance(level1_daily, dict) else daily_data_sg.get(eqp_name, {})
                                     daily_count = daily_eqp_data.get('count', 0)
                                     daily_rate_val = daily_eqp_data.get('rate', 0.0)
-                                else:
-                                    daily_count = 0
-                                    daily_rate_val = 0.0
 
-                                gap_val = rates.get(eqp_name, 0.0)
+                                    gap_val = rates.get(eqp_name, 0.0)
 
-                                eqp_rows.append({
-                                    '불량': rej_group,
-                                    '구분': proc,
-                                    '장비': eqp_name,
-                                    'Ref_Count': ref_count,
-                                    'Daily_Count': daily_count,
-                                    'Ref_rate': ref_rate_val / 100.0,
-                                    'Daily_rate': daily_rate_val / 100.0,
-                                    'Gap': gap_val
-                                })
+                                    #  '불량'에 소분류 사용
+                                    eqp_rows.append({
+                                        '불량': sub_group,  # ← BROKEN → LAP_BROKEN
+                                        '구분': proc,
+                                        '장비': eqp_name,
+                                        'Ref_Count': ref_count,
+                                        'Daily_Count': daily_count,
+                                        'Ref_rate': ref_rate_val / 100.0,
+                                        'Daily_rate': daily_rate_val / 100.0,
+                                        'Gap': gap_val
+                                    })
 
-                            # Gap 절대값 기준 상위 3개
-                            eqp_rows_sorted = sorted(eqp_rows, key=lambda x: abs(x['Gap']), reverse=True)[:3]
-                            all_table_rows.extend(eqp_rows_sorted)
+                                eqp_rows_sorted = sorted(eqp_rows, key=lambda x: abs(x['Gap']), reverse=True)[:3]
+                                table_rows.extend(eqp_rows_sorted)
 
-                # 표 데이터 작성 + 구분 병합
-                if all_table_rows:
-                    current_defect = None  # 불량코드
-                    current_process = None  # 공정코드
-                    defect_merge_start = None
-                    process_merge_start = None
+                    # 표 작성
+                    if table_rows:
+                        current_defect = None  # 소분류 기준
+                        current_process = None
+                        defect_merge_start = None
+                        process_merge_start = None
 
-                    for r_idx, row in enumerate(all_table_rows, table_start_row + 1):
-                        if row['불량'] != current_defect:
-                            if current_defect is not None and defect_merge_start is not None:
-                                merge_end_row = r_idx - 1
-                                if merge_end_row > defect_merge_start:
-                                    ws.merge_cells(f'A{defect_merge_start}:A{merge_end_row}')
+                        for r_idx, row in enumerate(table_rows, table_start_row + 1):
+                            # ✅ 소분류 기준으로 병합
+                            if row['불량'] != current_defect:
+                                if defect_merge_start is not None and r_idx - 1 > defect_merge_start:
+                                    ws.merge_cells(f'A{defect_merge_start}:A{r_idx - 1}')
                                     ws[f'A{defect_merge_start}'].alignment = Alignment(horizontal='center', vertical='center')
-                            current_defect = row['불량']
-                            defect_merge_start = r_idx
+                                current_defect = row['불량']
+                                defect_merge_start = r_idx
 
-                        # 구분 병합 처리
-                        if row['구분'] != current_process:
-                            if current_process is not None and process_merge_start is not None:
-                                merge_end_row = r_idx - 1
-                                if merge_end_row > process_merge_start:
-                                    ws.merge_cells(f'B{process_merge_start}:B{merge_end_row}')
+                            if row['구분'] != current_process:
+                                if process_merge_start is not None and r_idx - 1 > process_merge_start:
+                                    ws.merge_cells(f'B{process_merge_start}:B{r_idx - 1}')
                                     ws[f'B{process_merge_start}'].alignment = Alignment(horizontal='center', vertical='center')
-                            current_process = row['구분']
-                            process_merge_start = r_idx
+                                current_process = row['구분']
+                                process_merge_start = r_idx
 
-                        # A 열: 불량
-                        cell = ws.cell(row=r_idx, column=1, value=row['불량'])
-                        cell.font = Font(size=9)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
+                            for col, key, fmt, align in [
+                                (1, '불량', None, 'center'),
+                                (2, '구분', None, 'center'),
+                                (3, '장비', None, 'center'),
+                                (4, 'Ref_Count', '#,##0', 'center'),
+                                (5, 'Daily_Count', '#,##0', 'center'),
+                                (6, 'Ref_rate', '0.00%', 'center'),
+                                (7, 'Daily_rate', '0.00%', 'center'),
+                                (8, 'Gap', '+0.00%;-0.00%;0.00%', 'center')
+                            ]:
+                                cell = ws.cell(row=r_idx, column=col, value=row[key])
+                                if fmt: cell.number_format = fmt
+                                cell.font = Font(size=9)
+                                cell.alignment = Alignment(horizontal=align, vertical='center')
+                                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                                    top=Side(style='thin'), bottom=Side(style='thin'))
+                                if col == 8:
+                                    gap_num = row['Gap']
+                                    if gap_num > 0:
+                                        cell.fill = PatternFill("solid", fgColor="FFCCCC")
+                                        cell.font = Font(color="FF0000", size=9)
+                                    elif gap_num < 0:
+                                        cell.fill = PatternFill("solid", fgColor="CCE5FF")
+                                        cell.font = Font(color="0000FF", size=9)
 
-                        # B 열: 구분 (공정코드)
-                        cell = ws.cell(row=r_idx, column=2, value=row['구분'])
-                        cell.font = Font(size=9)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
+                        # 마지막 병합
+                        if defect_merge_start:
+                            merge_end = table_start_row + len(table_rows)
+                            if merge_end > defect_merge_start:
+                                ws.merge_cells(f'A{defect_merge_start}:A{merge_end}')
+                                ws[f'A{defect_merge_start}'].alignment = Alignment(horizontal='center', vertical='center')
+                        if process_merge_start:
+                            merge_end = table_start_row + len(table_rows)
+                            if merge_end > process_merge_start:
+                                ws.merge_cells(f'B{process_merge_start}:B{merge_end}')
+                                ws[f'B{process_merge_start}'].alignment = Alignment(horizontal='center', vertical='center')
 
-                        # C 열: 장비 (column=3)
-                        cell = ws.cell(row=r_idx, column=3, value=row['장비'])
-                        cell.font = Font(size=9)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
+                        # 모수 행
+                        last_row = table_start_row + len(table_rows) + 1
+                        ws.merge_cells(f'A{last_row}:B{last_row}')
+                        ws.cell(row=last_row, column=1, value="모수").font = Font(size=9, bold=True)
+                        ws.cell(row=last_row, column=1).alignment = Alignment(horizontal='center', vertical='center')
+                        ws.cell(row=last_row, column=3, value="")
+                        cell4 = ws.cell(row=last_row, column=4, value=float(getattr(self, 'avg_in_qty', 0)))
+                        cell4.number_format = '#,##0'
+                        cell4.font = Font(size=9)
+                        cell4.alignment = Alignment(horizontal='center', vertical='center')
+                        cell5 = ws.cell(row=last_row, column=5, value=float(getattr(self, 'total_daily_qty', 0)))
+                        cell5.number_format = '#,##0'
+                        cell5.font = Font(size=9)
+                        cell5.alignment = Alignment(horizontal='center', vertical='center')
+                        for col in [6, 7, 8]:
+                            ws.cell(row=last_row, column=col, value="")
+                        for col in range(1, 9):
+                            ws.cell(row=last_row, column=col).border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                                                            top=Side(style='thin'), bottom=Side(style='thin'))
 
-                        # D 열: Ref.(3 개월) 수량 (column=4)
-                        cell = ws.cell(row=r_idx, column=4, value=row['Ref_Count'])
-                        cell.number_format = '#,##0'
-                        cell.font = Font(size=9)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
+                        current_row = last_row + 2
+                    else:
+                        current_row = next_row_after_graph + 3
 
-                        # E 열: 일 수량 (column=5)
-                        cell = ws.cell(row=r_idx, column=5, value=row['Daily_Count'])
-                        cell.number_format = '#,##0'
-                        cell.font = Font(size=9)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
-
-                        # F 열: Ref.(3 개월) 불량률 (column=6)
-                        cell = ws.cell(row=r_idx, column=6, value=row['Ref_rate'])
-                        cell.number_format = '0.00%'
-                        cell.font = Font(size=9)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
-
-                        # G 열: 일 불량률 (column=7)
-                        cell = ws.cell(row=r_idx, column=7, value=row['Daily_rate'])
-                        cell.number_format = '0.00%'
-                        cell.font = Font(size=9)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
-
-                        # H 열: Gap (column=8)
-                        cell = ws.cell(row=r_idx, column=8, value=row['Gap'])
-                        cell.number_format = '+0.00%;-0.00%;0.00%'
-                        cell.font = Font(size=9)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
-                        try:
-                            gap_num = row['Gap']
-                            if gap_num > 0:
-                                cell.fill = PatternFill("solid", fgColor="FFCCCC")
-                                cell.font = Font(color="FF0000", bold=False, size=9)
-                            elif gap_num < 0:
-                                cell.fill = PatternFill("solid", fgColor="CCE5FF")
-                                cell.font = Font(color="0000FF", bold=False, size=9)
-                        except:
-                            pass
-
-                    # 마지막 병합 (불량)
-                    if current_defect is not None and defect_merge_start is not None:
-                        merge_end_row = table_start_row + len(all_table_rows)
-                        if merge_end_row > defect_merge_start:
-                            ws.merge_cells(f'A{defect_merge_start}:A{merge_end_row}')
-                            ws[f'A{defect_merge_start}'].alignment = Alignment(horizontal='center', vertical='center')
-
-                    # 마지막 병합 (구분)
-                    if current_process is not None and process_merge_start is not None:
-                        merge_end_row = table_start_row + len(all_table_rows)
-                        if merge_end_row > process_merge_start:
-                            ws.merge_cells(f'B{process_merge_start}:B{merge_end_row}')
-                            ws[f'B{process_merge_start}'].alignment = Alignment(horizontal='center', vertical='center')
-
-                    # ───────────────────────────────────────────────
-                    # 맨 아래에 모수 행 삽입
-                    # ───────────────────────────────────────────────
-                    last_row = table_start_row + len(all_table_rows) + 1  # 마지막 데이터 아래
-
-                    avg_in_qty = getattr(self, 'avg_in_qty', 0)
-                    total_daily_qty = getattr(self, 'total_daily_qty', 0)
-
-                    # 강제 float 변환 (Decimal → float)
-                    try:
-                        avg_in_qty = float(avg_in_qty)
-                        total_daily_qty = float(total_daily_qty)
-                    except (TypeError, ValueError) as e:
-                        return 
-
-                    # A 열: 구분: "모수" (병합: A-B)
-                    cell = ws.cell(row=last_row, column=1, value="모수")
-                    cell.font = Font(size=9, bold=True)
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                    cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                        top=Side(style='thin'), bottom=Side(style='thin'))
-                    ws.merge_cells(f'A{last_row}:B{last_row}')  # 🔧 A-B 병합
-
-                    # C 열: 장비: 빈칸 (자동)
-                    cell = ws.cell(row=last_row, column=3, value="")
-                    cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                        top=Side(style='thin'), bottom=Side(style='thin'))
-
-                    # D 열: Ref.(3 개월): avg_in_qty (column=4)
-                    cell = ws.cell(row=last_row, column=4, value=avg_in_qty)
-                    cell.number_format = '#,##0'
-                    cell.font = Font(size=9)
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                    cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                        top=Side(style='thin'), bottom=Side(style='thin'))
-
-                    # E 열: 일: total_daily_qty (column=5)
-                    cell = ws.cell(row=last_row, column=5, value=total_daily_qty)
-                    cell.number_format = '#,##0'
-                    cell.font = Font(size=9)
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                    cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                        top=Side(style='thin'), bottom=Side(style='thin'))
-
-                    # F, G, H 열: 빈칸 (column=6, 7, 8)
-                    for col in [6, 7, 8]:
-                        cell = ws.cell(row=last_row, column=col, value="")
-                        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                            top=Side(style='thin'), bottom=Side(style='thin'))
-
-                current_row = last_row + 2
-
-                
+               
             # ──────────────────────────────────────────────────
             # 7. [장비별 불량률 추세 분석] - _plot_rej_group_top3_eqp_trend 결과 삽입
             # ──────────────────────────────────────────────────
@@ -3959,8 +4815,8 @@ class DailyReportGenerator:
                     print(f"[INFO] EQP_TREND_GRAPHS report에 복사됨: {list(eqp_graphs.keys())}")
 
             # top3_rej_groups 가져오기
-            top3_rej_groups = self.data.get('DATA_3210_wafering_300', {}).get('top3_rej_groups', [])
-            # top3_rej_groups = ['PIT', 'EDGE', 'VISUAL']
+            # top3_rej_groups = self.data.get('DATA_3210_wafering_300', {}).get('top3_rej_groups', [])
+            top3_rej_groups = ['BROKEN', 'EDGE', 'CHIP']
             valid_groups = [g for g in top3_rej_groups if g in ['PIT', 'SCRATCH', 'EDGE', 'BROKEN', 'CHIP', 'VISUAL']]
             eqp_trend_graphs = report.get('EQP_TREND_GRAPHS', {})
 
@@ -3971,8 +4827,20 @@ class DailyReportGenerator:
                 if rej_group not in valid_groups:
                     current_row += 1
                     continue
-
-                paths = eqp_trend_graphs.get(rej_group, [])
+                # BROKEN, CHIP은 하위 그룹 합쳐서 그래프 가져오기
+                paths = []
+                if rej_group == 'BROKEN':
+                    sub_groups = ['LAP_BROKEN', 'EP_BROKEN', 'DSP_BROKEN', 'FP_BROKEN']
+                    for sg in sub_groups:
+                        if sg in eqp_trend_graphs:
+                            paths.extend(eqp_trend_graphs[sg])
+                elif rej_group == 'CHIP':
+                    sub_groups = ['CHIP-LAP', 'EDGE-CHIP', 'CHIP_EG1AF', 'CHIP_EG1BF', 'E_CHIP']
+                    for sg in sub_groups:
+                        if sg in eqp_trend_graphs:
+                            paths.extend(eqp_trend_graphs[sg])
+                else:
+                    paths = eqp_trend_graphs.get(rej_group, [])
                 if not paths:
                     ws.cell(row=current_row, column=1, value=f"{rej_group}: 그래프 없음").font = Font(size=10, color="FF0000")
                     current_row += 1  # 다음 행으로 이동
@@ -3982,11 +4850,14 @@ class DailyReportGenerator:
                 graph_row = current_row + 1
 
                 # 장비별 그래프 삽입 (최대 3개, A, G, M 열)
-                for idx, path in enumerate(paths[:3]):
+                for idx, path in enumerate(paths):
                     path_obj = Path(path)
                     if not path_obj.exists():
-                        col_letter = ['A', 'F', 'K'][idx]
-                        ws.cell(row=graph_row , column=1 + idx * 5, value=f"{rej_group}: 파일 없음").font = Font(size=9, color="FF0000")
+                        col_letter = ['A', 'F', 'K'][idx % 3]
+                        current_col = 1 + (idx % 3) * 5
+                        current_row_target = graph_row + (idx // 3) * 11  # 🔹 동적 행 계산
+                        ws.cell(row=current_row_target, column=current_col,
+                                value=f"{rej_group}: 파일 없음").font = Font(size=9, color="FF0000")
                         continue
 
                     try:
@@ -3994,18 +4865,24 @@ class DailyReportGenerator:
                         img = ExcelImage(img_path)
                         img.width = 400
                         img.height = 200
-                        col_letter = ['A', 'F', 'K'][idx]
-                        ws.add_image(img, f'{col_letter}{graph_row}')
-                        print(f"[OK] 엑셀에 삽입됨: {img_path}")
+                        col_letter = ['A', 'F', 'K'][idx % 3]
+                        current_row_target = graph_row + (idx // 3) * 11
+                        ws.add_image(img, f'{col_letter}{current_row_target}')
+                        print(f"[OK] 삽입됨: {img_path} → {col_letter}{current_row_target}")
                     except Exception as e:
-                        print(f"[ERROR] 이미지 삽입 실패: {e}")
-                        ws.cell(row=graph_row , column=1 + idx * 5, value=f"{rej_group} 실패").font = Font(size=9, color="FF0000")
+                        print(f"[ERROR] 삽입 실패: {e} | idx={idx}, path={path}")
+                        current_row_target = graph_row + (idx // 3) * 11
+                        ws.cell(row=current_row_target, column=1 + (idx % 3) * 5,
+                                value=f"{rej_group} 실패").font = Font(size=9, color="FF0000")
 
-                # 🔹 한 줄 끝나면 다음 행으로 이동 (그래프 높이 고려)
-                current_row += 11
+                # 그래프 수에 따라 동적 행 이동
+                total_rows_needed = ((len(paths) - 1) // 3 + 1) * 11
+                current_row += total_rows_needed
+
+                print(f"[DEBUG] {rej_group}: graph_row={graph_row}, paths={len(paths)}, total_move={total_rows_needed}")
 
             # 열 너비
-            for col, width in zip('ABCDEFGHIJ', [13] + [12]*9):
+            for col, width in zip('ABCDEFGHIJ', [15] + [12]*9):
                 ws.column_dimensions[col].width = width
 
             wb.save(str(excel_path))
