@@ -32,3 +32,27 @@ REJ_GROUP_TO_MID_MAPPING = {
     }
 
 }
+
+#    - 분석 그룹이 장비 기반 분석 가능한 경우에만 정의
+NAME_TO_EQP = {
+    'EQP_NM_300_WF_3300' : 'ASC',
+    'EQP_NM_300_WF_3335' : 'EG1차',
+    'EQP_NM_300_WF_3670' : 'LAP',
+    'EQP_NM_300_WF_3696' : 'EG2차',
+    'EQP_NM_300_WF_6100' : 'DSP',
+    'EQP_NM_300_WF_6210' : 'EP',
+    'EQP_NM_300_WF_6500' : 'FP',
+    'EQP_NM_300_WF_7000' : 'EBIS'
+}
+
+
+MID_TO_EQP = {
+    'ASC' : 'EQP_NM_300_WF_3300',
+    'EG1차' : 'EQP_NM_300_WF_3335',
+    'LAP' : 'EQP_NM_300_WF_3670',
+    'EG2차' : 'EQP_NM_300_WF_3696',
+    'DSP' : 'EQP_NM_300_WF_6100',
+    'EP' : 'EQP_NM_300_WF_6210',
+    'FP' : 'EQP_NM_300_WF_6500',
+    'EBIS' : 'EQP_NM_300_WF_7000' 
+}
