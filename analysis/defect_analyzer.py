@@ -1,4 +1,18 @@
 import pandas as pd
+from config.mappings import REJ_GROUP_TO_MID_MAPPING
+
+
+def add_mid_group(df, rej_group):
+    """
+    AFT_BAD_RSN_CD를 기준으로 MID_GROUP 생성
+    매핑 정보는 mapping.py 에서 가져옴
+    """
+    mapping = REJ_GROUP_TO_MID_MAPPING.get(rej_group, {})
+    df = df.copy()
+    df['MID_GROUP'] = df['AFT_BAD_RSN_CD'].map(mapping)
+    # 매핑되지 않은 것은 원래 값 유지
+    df['MID_GROUP'] = df['MID_GROUP'].fillna(df['AFT_BAD_RSN_CD'])
+    return df
 
 def safe_convert_loss_qty(df, col_name='LOSS_QTY'):
     """
@@ -7,175 +21,136 @@ def safe_convert_loss_qty(df, col_name='LOSS_QTY'):
     """
     if col_name not in df.columns:
         raise KeyError(f"컬럼 없음: {col_name}")
-
-    def convert(x):
-        try:
-            if pd.isna(x):
-                return 0
-            x_str = str(x).strip()
-            if x_str in ['', '-', '.', 'None', 'NULL', 'N/A', '?']:
-                return 0
-            return int(float(x_str))  # float → int (소수점 버림)
-        except:
-            return 0  # 변환 실패 시 0 처리
-
-    df[col_name] = df[col_name].apply(convert).astype('int64')
+    df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
     return df
 
 
-def analyze_flatness(df_lot):
+def analyze_flatness(df_lot, target_mids=None):
     """
-    FLATNESS 불량에 대해 AFT_BAD_RSN_CD 기준 상위 3개 코드 분석
-    조건: LOSS_QTY >= 30, 등급 재분류 적용
-    입력: df_lot (DATA_LOT_3210_wafering_300 결과)
+    FLATNESS 불량 분석 (디버그 포함)
     """
+
     # 1. FLATNESS 데이터 필터링
     df = df_lot[df_lot['REJ_GROUP'] == 'FLATNESS'].copy()
-    
-    # 데이터 없으면 즉시 종료
+    df = df[df['GRD_CD_NM_CS'] == 'Prime']
     if df.empty:
         return ["[FLATNESS 분석] 데이터 없음"]
 
-    # 2. AFT_BAD_RSN_CD별 LOSS_QTY 합계 → 상위 3개
-    code_summary = (
-        df.groupby('AFT_BAD_RSN_CD')['LOSS_QTY']
-        .sum()
-        .sort_values(ascending=False)
-        .head(3)
-    )
+    # 숫자형 변환
+    df = safe_convert_loss_qty(df, 'LOSS_QTY')
+    df = add_mid_group(df, 'FLATNESS')
 
-    if code_summary.empty:
-        return ["[FLATNESS 분석] 상위 코드 없음"]
+    #  target_mids 필터링
+    if target_mids is not None and len(target_mids) > 0:
+        print(f"  - target_mids 적용: {target_mids}")
+        before_filter = len(df)
+        df = df[df['MID_GROUP'].isin(target_mids)]
+        after_filter = len(df)
+        print(f"  - 필터 전: {before_filter} → 필터 후: {after_filter}")
+        # 순서 유지
+        mid_list = [mid for mid in target_mids if mid in df['MID_GROUP'].unique()]
+    else:
+        mid_list = df.groupby('MID_GROUP')['LOSS_QTY'].sum().sort_values(ascending=False).index.tolist()
+
+    if not mid_list:
+        return ["[FLATNESS 분석] 대상 MID_GROUP 없음"]
 
     result = ["[FLATNESS 분석]"]
-    top3_codes = code_summary.index.tolist()
-
-    # 3. 각 코드별 상세 분석
-    for code in top3_codes:
-        df_code = df[df['AFT_BAD_RSN_CD'] == code].copy()
-
-        # CUST_SITE_NM, 등급 기준 집계
-        grouped = (
-            df_code
-            .groupby(['PRODUCT_TYPE', 'GRD_CD_NM_CS', 'GRD_CD_NM_PS'], dropna=False)['LOSS_QTY'] #CUST_SITE_NM
-            .sum()
-            .reset_index()
-        )
-
-        # 30장 이상만 필터
-        grouped = grouped[grouped['LOSS_QTY'] >= 30]
+    for mid in mid_list:
+        df_mid = df[df['MID_GROUP'] == mid].copy()
+        grouped = (df_mid
+                   .groupby(['AFT_BAD_RSN_CD', 'PRODUCT_TYPE', 'GRD_CD_NM_CS', 'GRD_CD_NM_PS'], dropna=False)['LOSS_QTY']
+                   .sum()
+                   .reset_index())
+        grouped = grouped[grouped['LOSS_QTY'] >= 30].nlargest(3, 'LOSS_QTY')
 
         if grouped.empty:
             continue
 
-        # 수량 기준 정렬
-        grouped = grouped.sort_values(by='LOSS_QTY', ascending=False).reset_index(drop=True)
-        top_row = grouped.iloc[0]  # 상위 1개
-
-        # 등급 재분류
-        grade_cs = top_row['GRD_CD_NM_CS']
-        grade_ps = top_row['GRD_CD_NM_PS']
-
-        if grade_cs == 'Prime' and grade_ps == 'Prime':
-            final_grade = 'Prime'
-        elif grade_cs == 'Normal' and grade_ps == 'Normal':
-            final_grade = 'Normal'
-        elif grade_cs == 'Normal' and grade_ps == 'Prime':
-            final_grade = 'Premium'
-        else:
-            final_grade = grade_cs  # 기본값
-
-        qty = int(top_row['LOSS_QTY'])
-        cust = top_row['PRODUCT_TYPE'] if pd.notna(top_row['PRODUCT_TYPE']) else 'Unknown' #CUST_SITE_NM
-
-        result.append(f"- {code} {cust} {final_grade} {qty}매")
-
-    # 결과 없을 경우 처리
-    if len(result) == 1:
-        result.append("상위 30장 이상 불량 없음")
-
-    return result
-
-def analyze_warp(df_wafer):
-    """
-    Nano Warp 불량 분석 통합 함수:
-    1) 대량불량 (LOSS_QTY ≥ 100): 설비, 날짜 포함 문장 생성
-    2) 소량 반복 불량 (LOSS_QTY < 100): AFT_BAD_RSN_CD 기준 상위 3개 중, 각각 상위 3개 BLK_ID 추출
-    입력: df_wafer (DATA_WAF_3210_wafering_300 결과)
-    """
-    df_wafer = df_wafer[df_wafer['REJ_GROUP'] == 'WARP&BOW'].copy()
-
-    if df_wafer.empty:
-        return ["[WARP&BOW 분석] 데이터 없음"]
-
-    df_wafer = safe_convert_loss_qty(df_wafer, 'LOSS_QTY')
-
-    result_lines = ["[WARP&BOW 분석]"]
-
-    # 날짜 포맷 변경: YYYYMMDDHHMMSS → M/D
-    def format_date(val):
-        try:
-            val_str = str(val)
-            if len(val_str) >= 8 and val_str[:8].isdigit():
-                month = str(int(val_str[4:6]))
-                day = str(int(val_str[6:8]))
-                return f"{month}/{day}"
-            else:
-                return "Unknown"
-        except:
-            return "Unknown"
-
-    df_wafer['REG_DTTM_3200_FMT'] = df_wafer['REG_DTTM_300_WF_3200'].apply(format_date)
-
-    # 공통 그룹 컬럼
-    group_cols = ['AFT_BAD_RSN_CD', 'BLK_ID', 'EQP_NM_300_WF_3200', 'REG_DTTM_3200_FMT']
-    grouped = df_wafer.groupby(group_cols, dropna=False)['LOSS_QTY'].sum().reset_index()
-
-    # 대량불량: LOSS_QTY ≥ 100
-    large_defects = grouped[grouped['LOSS_QTY'] >= 100].copy()
-    for _, row in large_defects.iterrows():
-        line = f"{row['AFT_BAD_RSN_CD']} {row['BLK_ID']}의 {int(row['LOSS_QTY'])}매 ({row['EQP_NM_300_WF_3200']} {row['REG_DTTM_3200_FMT']})"
-        result_lines.append(line)
-
-    # 소량 반복 불량: LOSS_QTY < 100
-    minor_group_cols = ['AFT_BAD_RSN_CD', 'BLK_ID', 'PRODUCT_TYPE', 'GRADE_CS']    # CUST_SITE_NM
-    grouped_minor = df_wafer[df_wafer['LOSS_QTY'] < 100].groupby(minor_group_cols, dropna=False)['LOSS_QTY'].sum().reset_index()
-
-    if grouped_minor.empty:
-        if len(result_lines) == 1:
-            result_lines.append("대량/소량 불량 없음")
-        return result_lines
-
-    # AFT_BAD_RSN_CD 기준 LOSS_QTY 합계 → 상위 3개 코드 추출
-    top3_codes = (
-        grouped_minor.groupby('AFT_BAD_RSN_CD')['LOSS_QTY']
-        .sum()
-        .sort_values(ascending=False)
-        .head(3)
-        .index.tolist()
-    )
-
-    if not top3_codes:
-        if len(result_lines) == 1:
-            result_lines.append("소량 반복 불량 없음")
-        return result_lines
-
-    # 각 상위 코드별로 상위 3개 BLK_ID 추출
-    for code in top3_codes:
-        df_code = grouped_minor[grouped_minor['AFT_BAD_RSN_CD'] == code].copy()
-        top3_blks = df_code.nlargest(3, 'LOSS_QTY')
-
-        for _, row in top3_blks.iterrows():
-            cust = row['PRODUCT_TYPE'] if pd.notna(row['PRODUCT_TYPE']) else 'Unknown' #PRODUCT_TYPE CUST_SITE_NM
-            grade = row['GRADE_CS'] if pd.notna(row['GRADE_CS']) else 'Unknown'
+        parts = []
+        for _, row in grouped.iterrows():
+            cs, ps = row['GRD_CD_NM_CS'], row['GRD_CD_NM_PS']
+            grade = ('Prime' if (cs == 'Prime' and ps == 'Prime') else
+                     'Normal' if (cs == 'Normal' and ps == 'Normal') else
+                     'Premium' if (cs == 'Normal' and ps == 'Prime') else cs)
+            cust = row['PRODUCT_TYPE'] if pd.notna(row['PRODUCT_TYPE']) else 'Unknown'
             qty = int(row['LOSS_QTY'])
-            line = f"{code} 열위 Lot - {cust} {grade} {row['BLK_ID']} {qty}매"
-            result_lines.append(line)
+            parts.append(f" {cust} {grade} {qty}매")
 
-    if len(result_lines) == 1:
-        result_lines.append("분석 결과 없음")
+        if parts:
+            line = f"- {mid} - " + ", ".join(parts)
+            result.append(line)
 
-    return result_lines
+    return result if len(result) > 1 else result + ["상위 30장 이상 없음"]
+
+
+def analyze_warp(df_wafer, target_mids=None):
+    """
+    Nano Warp 불량 분석 통합 함수 (디버그 모드 포함)
+    """
+    df = df_wafer[df_wafer['REJ_GROUP'] == 'WARP&BOW'].copy()
+    df = df[df['GRADE_CS'] == 'Prime']
+
+    df = safe_convert_loss_qty(df, 'LOSS_QTY')
+
+    # 날짜 포맷팅
+    def format_date(val):
+        s = str(val)
+        return f"{int(s[4:6])}/{int(s[6:8])}" if len(s) >= 8 and s[:8].isdigit() else "Unknown"
+
+    df['REG_DTTM_3200_FMT'] = df['REG_DTTM_300_WF_3200'].apply(format_date)
+
+    result = ["[WARP&BOW 분석]"]
+
+    # --- 대량불량 ---
+    large = (df.groupby(['AFT_BAD_RSN_CD', 'BLK_ID', 'EQP_NM_300_WF_3200', 'REG_DTTM_3200_FMT'], dropna=False)['LOSS_QTY']
+             .sum().reset_index())
+
+    for _, row in large[large['LOSS_QTY'] >= 100].iterrows():
+        result.append(f"{row['AFT_BAD_RSN_CD']} {row['BLK_ID']}의 {int(row['LOSS_QTY'])}매 ({row['EQP_NM_300_WF_3200']} {row['REG_DTTM_3200_FMT']})")
+
+    # --- 소량 불량 ---
+    df_minor = df[df['LOSS_QTY'] < 100].copy()
+    if df_minor.empty:
+        print("  - 소량불량 데이터 없음")
+    else:
+        # add_mid_group 함수 확인 필요
+        if 'add_mid_group' not in globals() and 'add_mid_group' not in locals():
+            print("❌ add_mid_group 함수가 정의되지 않음")
+            return result + ["[오류] add_mid_group 없음"]
+
+        try:
+            df_minor = add_mid_group(df_minor, 'WARP&BOW')
+        except Exception as e:
+            print(f"❌ add_mid_group 실행 오류: {e}")
+            return result + ["[오류] MID_GROUP 생성 실패"]
+
+        # target_mids 가 있으면 그 값만 분석 (상위 3 개)
+        if target_mids and len(target_mids) > 0:
+            analysis_mids = target_mids[:3]  #  최대 3 개만
+        else:
+            # 전체 MID_GROUP 분석 (기존 로직)
+            if 'MID_GROUP' in df_minor.columns:
+                mid_summary = df_minor.groupby('MID_GROUP')['LOSS_QTY'].sum().sort_values(ascending=False)
+                analysis_mids = mid_summary.index.tolist()[:3]  # 상위 3 개
+            else:
+                return result + ["소량분석: MID_GROUP 없음"]
+
+        # 각 MID_GROUP별 상위 3개 BLK_ID 분석
+        for mid in analysis_mids:
+            df_m = df_minor[df_minor['MID_GROUP'] == mid].copy()
+
+            grouped = (df_m.groupby(['AFT_BAD_RSN_CD', 'BLK_ID', 'PRODUCT_TYPE', 'GRADE_CS'], dropna=False)['LOSS_QTY']
+                       .sum().reset_index().nlargest(3, 'LOSS_QTY'))
+
+            if grouped.empty:
+                continue
+
+            parts = [f"{r['PRODUCT_TYPE']} {r['GRADE_CS']} {r['BLK_ID']} {int(r['LOSS_QTY'])}매" for _, r in grouped.iterrows()]
+            result.append(f"- {mid} 열위 Lot - " + ", ".join(parts))
+
+    return result if len(result) > 1 else result + ["대량/소량 없음"]
+
 
 def analyze_growing(df_lot):
     """
@@ -185,10 +160,11 @@ def analyze_growing(df_lot):
     입력: df_lot (DATA_LOT_3210_wafering_300 결과)
     """
     df_lot = df_lot[df_lot['REJ_GROUP'] == 'GROWING'].copy()
+    df_lot = df_lot[df_lot['GRD_CD_NM_CS'] == 'Prime']
 
     if df_lot.empty:
         return ["[GROWING 분석] 데이터 없음"]
-
+    df_lot = safe_convert_loss_qty(df_lot, 'LOSS_QTY')
     result_lines = ["[GROWING 분석]"]
 
     # AFT_BAD_RSN_CD 기준 LOSS_QTY 합계 → 상위 3개 코드 추출
@@ -205,7 +181,7 @@ def analyze_growing(df_lot):
 
     top3_codes = code_summary.index.tolist()
 
-    # 각 상위 코드별로 IGOT_ID 기준 상위 3개 추출
+    # 각 코드별 결과를 모았다가 한 줄로 병합
     for code in top3_codes:
         df_code = df_lot[df_lot['AFT_BAD_RSN_CD'] == code].copy()
         grouped = df_code.groupby('IGOT_ID', dropna=False)['LOSS_QTY'].sum().reset_index()
@@ -214,16 +190,20 @@ def analyze_growing(df_lot):
         if grouped.empty:
             continue
 
+        content_parts = []
         for _, row in grouped.iterrows():
             igot = row['IGOT_ID'] if pd.notna(row['IGOT_ID']) else 'Unknown'
             qty = int(row['LOSS_QTY'])
-            line = f"{code} {igot} {qty}매 폐기"
-            result_lines.append(line)
+            content_parts.append(f"{igot} {qty}매 폐기")
+        
+        if content_parts:
+            result_lines.append(f"- {code} - " + ", ".join(content_parts))
 
     if len(result_lines) == 1:
         result_lines.append("분석 결과 없음")
 
     return result_lines
+
 
 def analyze_broken(df_lot):
     """
@@ -234,10 +214,12 @@ def analyze_broken(df_lot):
     입력: df_lot (DATA_LOT_3210_wafering_300 결과)
     """
     df_lot = df_lot[df_lot['REJ_GROUP'] == 'BROKEN'].copy()
+    df_lot = df_lot[df_lot['GRD_CD_NM_CS'] == 'Prime']
 
     if df_lot.empty:
         return ["[BROKEN 분석] 데이터 없음"]
 
+    df_lot = safe_convert_loss_qty(df_lot, 'LOSS_QTY')
     result = ["[BROKEN 분석]"]
 
     # Step 1: 공정구분 - 'LAP', 'EP', 'FP', 'DSP' 포함 여부
@@ -324,6 +306,7 @@ def analyze_nano(df_wafer):
     입력: df_wafer (DATA_WAF_3210_wafering_300 결과)
     """
     df_wafer = df_wafer[df_wafer['REJ_GROUP'] == 'NANO'].copy()
+    df_wafer = df_wafer[df_wafer['GRADE_CS'] == 'Prime']
 
     if df_wafer.empty:
         return ["[NANO 분석] 데이터 없음"]
@@ -382,13 +365,21 @@ def analyze_nano(df_wafer):
     # 각 상위 코드별로 상위 3개 BLK_ID 추출
     for code in top3_codes:
         df_code = grouped_minor[grouped_minor['AFT_BAD_RSN_CD'] == code].copy()
-        top3_blks = df_code.nlargest(3, 'LOSS_QTY')
+        # BLK_ID 기준으로 PRODUCT_TYPE, GRADE_CS, LOSS_QTY 합계
+        grouped_code = (df_code.groupby(['BLK_ID', 'PRODUCT_TYPE', 'GRADE_CS'], dropna=False)['LOSS_QTY']
+                        .sum().reset_index())
+        top3_blks = grouped_code.nlargest(3, 'LOSS_QTY')
 
+        # 각 항목 포맷팅
+        parts = []
         for _, row in top3_blks.iterrows():
-            cust = row['PRODUCT_TYPE'] if pd.notna(row['PRODUCT_TYPE']) else 'Unknown' #PRODUCT_TYPE CUST_SITE_NM
-            grade = row['GRADE_CS'] if pd.notna(row['GRADE_CS']) else 'Unknown' 
+            cust = row['PRODUCT_TYPE'] if pd.notna(row['PRODUCT_TYPE']) else 'Unknown'
+            grade = row['GRADE_CS'] if pd.notna(row['GRADE_CS']) else 'Unknown'
             qty = int(row['LOSS_QTY'])
-            line = f"{code} 열위 Lot - {cust} {grade} {row['BLK_ID']} {qty}매"
+            parts.append(f"{cust} {grade} {row['BLK_ID']} {qty}매")
+
+        if parts:
+            line = f"- {code} 열위 Lot - " + ", ".join(parts)
             result_lines.append(line)
 
     if len(result_lines) == 1:
@@ -405,6 +396,7 @@ def analyze_pit(df_wafer):
     입력: df_wafer (DATA_WAF_3210_wafering_300 결과)
     """
     df_wafer = df_wafer[df_wafer['REJ_GROUP'] == 'PIT'].copy()
+    df_wafer = df_wafer[df_wafer['GRADE_CS'] == 'Prime']
 
     if df_wafer.empty:
         return ["[PIT 분석] 데이터 없음"]
@@ -480,26 +472,16 @@ def analyze_scratch(df_wafer):
     입력: df_wafer (DATA_WAF_3210_wafering_300 결과)
     """
     df_wafer = df_wafer[df_wafer['REJ_GROUP'] == 'SCRATCH'].copy()
+    df_wafer = df_wafer[df_wafer['GRADE_CS'] == 'Prime']
 
     if df_wafer.empty:
         return ["[SCRATCH 분석] 데이터 없음"]
 
     df_wafer = safe_convert_loss_qty(df_wafer, 'LOSS_QTY')
+    df_wafer = add_mid_group(df_wafer, 'SCRATCH')  # MID_GROUP 생성
 
     result = ["[SCRATCH 분석]"]
-
-    # 1. AFT_BAD_RSN_CD 기준 LOSS_QTY 합계 → 상위 3개
-    summary = (
-        df_wafer.groupby('AFT_BAD_RSN_CD', dropna=False)['LOSS_QTY']
-        .sum()
-        .sort_values(ascending=False)
-        .head(3)
-        .reset_index()
-    )
-
-    if summary.empty:
-        result.append("상위 불량 코드 없음")
-        return result
+    mid_results = {}
 
     # 분석 대상 공정 정의
     process_list = [
@@ -507,71 +489,54 @@ def analyze_scratch(df_wafer):
         {'eqp_col': 'EQP_NM_300_WF_3670', 'time_col': 'REG_DTTM_300_WF_3670'}
     ]
 
-    for _, row in summary.iterrows():
-        defect = row['AFT_BAD_RSN_CD']
-        loss_qty_total = int(row['LOSS_QTY'])
-        top_entries = []  # 각 공정별 최다 발생 정보 저장
+    for mid_name in ['Front Side', 'Back Side']:
+        df_mid = df_wafer[df_wafer['MID_GROUP'] == mid_name].copy()
+        if df_mid.empty:
+            continue
 
-        # 두 공정 모두 분석
+        total_qty = int(df_mid['LOSS_QTY'].sum())
+        details = []
+
         for proc in process_list:
             eqp_col = proc['eqp_col']
             time_col = proc['time_col']
 
-            # 현재 불량 코드에 대해 필터링
-            filtered = df_wafer[df_wafer['AFT_BAD_RSN_CD'] == defect].copy()
+            # 컬럼명 끝 4글자 → 공정 코드
+            proc_code = eqp_col[-4:]
 
-            # 장비 + 시간 기준 집계
-            grouped = (
-                filtered
-                .groupby([eqp_col, time_col], dropna=False)['LOSS_QTY']
-                .sum()
-                .reset_index()
-                .sort_values('LOSS_QTY', ascending=False)
-            )
+            # 장비 데이터 존재 여부 확인
+            df_proc = df_mid[df_mid[eqp_col].notna()].copy()
+            if df_proc.empty:
+                continue
 
-            if not grouped.empty:
-                top = grouped.iloc[0]
-                eqp_name = top[eqp_col]
-                reg_time = str(top[time_col])
+            # 장비별 합계
+            grouped = df_proc.groupby(eqp_col)['LOSS_QTY'].sum().reset_index()
+            for _, row in grouped.iterrows():
+                eqp = row[eqp_col]
+                qty = int(row['LOSS_QTY'])
+                eqp_str = eqp if pd.notna(eqp) else 'Unknown'
+                details.append(f"{proc_code} - {eqp_str} {qty}매")
 
-                # 시간 포맷 변환 (YYYYMMDD → M/D)
-                if len(reg_time) >= 8 and reg_time[:8].isdigit():
-                    reg_time_fmt = f"{int(reg_time[4:6])}/{int(reg_time[6:8])}"
-                else:
-                    reg_time_fmt = "Unknown"
-
-                # NaN 처리
-                eqp_str = eqp_name if pd.notna(eqp_name) else "Unknown"
-
-                top_entries.append({
-                    'eqp': eqp_str,
-                    'time': reg_time_fmt,
-                    'loss_qty': int(top['LOSS_QTY'])
-                })
-
-        # 결과 생성
-        if not top_entries:
-            result.append(f"{defect}: {loss_qty_total}매 (발생 장비 정보 없음)")
+        # 결과 포맷팅
+        if len(details) > 5:
+            shown = ", ".join(details[:5])
+            mid_results[mid_name] = f"{total_qty}매 ({shown} 등)"
+        elif details:
+            mid_results[mid_name] = f"{total_qty}매 ({', '.join(details)})"
         else:
-            # LOSS_QTY 기준 정렬 (내림차순)
-            top_entries.sort(key=lambda x: x['loss_qty'], reverse=True)
-            max_qty = top_entries[0]['loss_qty']
+            mid_results[mid_name] = f"{total_qty}매 (장비 정보 없음)"
 
-            # 동률인 항목들 추출
-            winners = [ent for ent in top_entries if ent['loss_qty'] == max_qty]
-
-            # 장비 정보 문자열 생성
-            if len(winners) == 1:
-                winner = winners[0]
-                result.append(f"{defect}: {loss_qty_total}매 ({winner['eqp']} {winner['loss_qty']}매 {winner['time']})")
-            else:
-                devices = " / ".join([f"{w['eqp']} {w['loss_qty']}매 {w['time']}" for w in winners])
-                result.append(f"{defect}: {loss_qty_total}매 ({devices})")
-
-    if len(result) == 1:
+    # 최종 문장 생성
+    parts = [f"{k} {v}" for k, v in mid_results.items()]
+    if parts:
+        result.append(", ".join(parts))
+    else:
         result.append("분석 결과 없음")
 
     return result
+
+
+
 
 def analyze_edge(df_wafer):
     """
@@ -583,6 +548,7 @@ def analyze_edge(df_wafer):
     """
     # REJ_GROUP 필터링
     df_wafer = df_wafer[df_wafer['REJ_GROUP'] == 'EDGE'].copy()
+    df_wafer = df_wafer[df_wafer['GRADE_CS'] == 'Prime']
 
     if df_wafer.empty:
         return ["[EDGE 분석] 데이터 없음"]
@@ -603,19 +569,19 @@ def analyze_edge(df_wafer):
         time_col = proc['time_col']
         label = proc['label']
 
-        # ✅ 장비 컬럼 존재 여부 체크
+        # 장비 컬럼 존재 여부 체크
         if eqp_col not in df_wafer.columns:
             result.append(f"{label} : 장비 컬럼 없음")
             continue
 
-        # ✅ 장비명이 NaN이 아닌 데이터만 필터링
+        # 장비명이 NaN이 아닌 데이터만 필터링
         df_proc = df_wafer[df_wafer[eqp_col].notna()].copy()
 
         if df_proc.empty:
             result.append(f"{label} : 데이터 없음")
             continue
 
-        # ✅ 장비별 LOSS_QTY 합계
+        # 장비별 LOSS_QTY 합계
         grouped = (
             df_proc.groupby(eqp_col, dropna=False)['LOSS_QTY']
             .sum()
@@ -624,7 +590,7 @@ def analyze_edge(df_wafer):
             .reset_index(drop=True)
         )
 
-        # ✅ 장비 1개만 존재할 경우
+        # 장비 1개만 존재할 경우
         if len(grouped) == 1:
             eqp = grouped.iloc[0][eqp_col]
             qty = int(grouped.iloc[0]['LOSS_QTY'])
@@ -632,7 +598,7 @@ def analyze_edge(df_wafer):
             result.append(f"{label} : 단일 장비 - {eqp_str} {qty}매")
             continue
 
-        # ✅ 장비 2개 이상: 상위 2개 비교
+        # 장비 2개 이상: 상위 2개 비교
         top1 = grouped.iloc[0]
         top2 = grouped.iloc[1]
         diff = int(top1['LOSS_QTY'] - top2['LOSS_QTY'])
@@ -640,7 +606,7 @@ def analyze_edge(df_wafer):
         top1_eqp = top1[eqp_col] if pd.notna(top1[eqp_col]) else "Unknown"
         top2_eqp = top2[eqp_col] if pd.notna(top2[eqp_col]) else "Unknown"
 
-        if diff >= 10:  # ✅ >= 10: 임계값 포함
+        if diff >= 10:  # >= 10: 임계값 포함
             result.append(f"{label} : {top1_eqp} 장비 몰림 발생 - {int(top1['LOSS_QTY'])}매 (2위 대비 +{diff}매)")
         else:
             result.append(f"{label} : 몰림 없음 - {top1_eqp} {int(top1['LOSS_QTY'])}매 / {top2_eqp} {int(top2['LOSS_QTY'])}매")
@@ -659,6 +625,7 @@ def analyze_chip(df_wafer):
     입력: df_wafer (DATA_WAF_3210_wafering_300 결과)
     """
     df_wafer = df_wafer[df_wafer['REJ_GROUP'] == 'CHIP'].copy()
+    df_wafer = df_wafer[df_wafer['GRADE_CS'] == 'Prime']
 
     if df_wafer.empty:
         return ["[CHIP 분석] 데이터 없음"]
@@ -698,7 +665,7 @@ def analyze_chip(df_wafer):
     df_sub = df_wafer[df_wafer['AFT_BAD_RSN_CD'] == top_defect].copy()
     eqp_cols = defect_mapping[top_defect]
 
-    # ✅ CHIP-EG1AF: 주 장비 없을 시 fallback
+    # CHIP-EG1AF: 주 장비 없을 시 fallback
     if top_defect == 'CHIP-EG1AF':
         primary_eqp = 'EQP_NM_300_WF_3335'
         if primary_eqp not in df_sub.columns or df_sub[primary_eqp].isna().all():
@@ -712,18 +679,18 @@ def analyze_chip(df_wafer):
         eqp_col = eqp_cols[i]
         time_col = eqp_cols[i + 1] if i + 1 < len(eqp_cols) else None
 
-        # ✅ 장비 컬럼 존재 여부 체크
+        # 장비 컬럼 존재 여부 체크
         if eqp_col not in df_sub.columns:
             result.append(f"{eqp_col}: 컬럼 없음")
             continue
 
-        # ✅ 장비명이 NaN이 아닌 데이터만
+        # 장비명이 NaN이 아닌 데이터만
         df_eqp = df_sub[df_sub[eqp_col].notna()].copy()
         if df_eqp.empty:
             result.append(f"{eqp_col}: 데이터 없음")
             continue
 
-        # ✅ 장비별 LOSS_QTY 합계
+        # 장비별 LOSS_QTY 합계
         grouped = (
             df_eqp.groupby(eqp_col, dropna=False)['LOSS_QTY']
             .sum()
@@ -758,9 +725,12 @@ def analyze_others(df_lot, rej_group):
         group_label_kr: 한글 그룹명 (예: '사람오류', '시각불량', ...)
     """
     df_group = df_lot[df_lot['REJ_GROUP'] == rej_group].copy()
+    df_group = df_group[df_group['GRD_CD_NM_CS'] == 'Prime']
 
     if df_group.empty:
         return [f"[{rej_group} 분석] 데이터 없음"]
+
+    df_group = safe_convert_loss_qty(df_group, 'LOSS_QTY')
 
     # AFT_BAD_RSN_CD별 합계 → 상위 1개
     defect_summary = (
@@ -804,10 +774,14 @@ def analyze_particle_ratios(df_lot, ref_value=1.8, threshold=0.5):
     FS/RESC/HG 불량률 및 반영율을 'IN_QTY 전체 합계'를 기준으로 계산하며,
     RESC 영향 여부도 함께 판단하여 결과 문자열로 반환.
     """
+    df_lot = df_lot[df_lot['GRD_CD_NM_CS'] == 'Prime']
     denominator_data = df_lot[df_lot['REJ_GROUP'] == '분모']
+    denominator_data = safe_convert_loss_qty(denominator_data, 'IN_QTY')
     total_in_qty = denominator_data['IN_QTY'].sum()
 
     df = df_lot[df_lot['REJ_GROUP'] == 'PARTICLE'].copy()
+    df = df[df['GRD_CD_NM_CS'] == 'Prime']
+    df = safe_convert_loss_qty(df, 'LOSS_QTY')
     result = []
     base_dt = df['BASE_DT'].iloc[0]
 
@@ -884,6 +858,7 @@ def create_particle_table(df_wafer):
 
     #pivot은 잘 안되서, groupby로 해결
     df_wafer = df_wafer[df_wafer['REJ_GROUP'] == 'PARTICLE'].copy()
+    df_wafer = df_wafer[df_wafer['GRADE_CS'] == 'Prime']
     df_grouped = df_wafer.groupby(index_cols, dropna=False)['LOSS_QTY'].sum().reset_index()
 
     #loss_qty별 구분
@@ -899,7 +874,7 @@ def create_particle_table(df_wafer):
     #매칭된 값이 존재하는 경우만 'Good'으로 설정
     df_grouped_plus.loc[df_grouped_plus['matching'].isin(df_grouped_minus['matching']), 'cat'] = 'Good'
 
-    # ✅ [수정] \\~ 제거 → 문자열 조건 직접 비교 (문제 없이 동작)
+    # [수정] \\~ 제거 → 문자열 조건 직접 비교 (문제 없이 동작)
     df_nan_particle = df_grouped_plus[df_grouped_plus['cat'] == 'NAN'].copy()  # 필터링
 
     top3_codes = (df_nan_particle.groupby('AFT_BAD_RSN_CD')['LOSS_QTY'].sum().sort_values(ascending=False).head(3).index.tolist()) # AFT_BAD_RSN_CD별 LOSS_QTY 합계 상위 3개 코드 추출
@@ -940,9 +915,6 @@ def analyze_particle(df_lot, df_wafer):
     result = []
     # 1) RC 판단 비율 분석
     df_result, rc_judgement = analyze_particle_ratios(df_lot)
-
-    print(df_result)
-    print(rc_judgement)
 
     # RESC Total 값 추출 (safe_get 없이 직접 처리)
     resc_total_row = df_result[
@@ -1001,76 +973,164 @@ def analyze_sample(df_lot):
         result.append("SAMPLE 불량 데이터 없음")
         return result
 
-    # AFT_BAD_RSN_CD별 LOSS_QTY 합계 → 상위 2개
-    defect_sums = (
-        df_lot.groupby('AFT_BAD_RSN_CD')['LOSS_QTY']
-        .sum()
-        .reset_index()
-        .sort_values('LOSS_QTY', ascending=False)
-        .head(2)
-    )
+    # 숫자형 변환
+    df_lot = safe_convert_loss_qty(df_lot, 'LOSS_QTY')
+    df_lot = add_mid_group(df_lot, 'SAMPLE')
 
-    if defect_sums.empty:
-        result.append("분석할 불량 데이터 없음")
-        return result
+    # ──────────────────────────────────────────────────
+    # 1) Eng'r Sample (ENGSFT, ENGSCT, ENGSIS)
+    # ──────────────────────────────────────────────────
+    eng_df = df_lot[df_lot['MID_GROUP'] == 'Engr Sample']
+    if not eng_df.empty:
+        code_summary = (eng_df.groupby('AFT_BAD_RSN_CD')['LOSS_QTY']
+                        .sum().reset_index().sort_values('LOSS_QTY', ascending=False))
+        parts = [f"{row['AFT_BAD_RSN_CD']} {int(row['LOSS_QTY'])}매" for _, row in code_summary.iterrows()]
+        result.append(f"- Eng'r Sample 발췌 증가 ({', '.join(parts)})")
 
-    for _, row in defect_sums.iterrows():
-        code = row['AFT_BAD_RSN_CD']
-        total_qty = int(row['LOSS_QTY'])
-        df_code = df_lot[df_lot['AFT_BAD_RSN_CD'] == code].copy()
+    # ──────────────────────────────────────────────────
+    # 2) Lot Sample (LOT_SMPL, LOT-SAMPLE)
+    # ──────────────────────────────────────────────────
+    lot_df = df_lot[df_lot['MID_GROUP'] == 'Lot Sample']
+    if not lot_df.empty:
+        prod_summary = (lot_df.groupby('PRODUCT_TYPE')['LOSS_QTY']
+                        .sum().reset_index().nlargest(2, 'LOSS_QTY'))
+        if not prod_summary.empty:
+            parts = [f"{row['PRODUCT_TYPE']} {int(row['LOSS_QTY'])}매" for _, row in prod_summary.iterrows()]
+            result.append(f"- Lot Sample ({', '.join(parts)})")
 
-        # 1) MON_SAMPLE
-        if code == 'MON_SAMPLE':
-            grouped = (
-                df_code.groupby('OPER_ID')['LOSS_QTY']
-                .sum()
-                .reset_index()
-                .sort_values('LOSS_QTY', ascending=False)
-            )
-            over20 = grouped[grouped['LOSS_QTY'] >= 20]
+    # ──────────────────────────────────────────────────
+    # 3) Monitoring Sample (MON_SAMPLE)
+    # ──────────────────────────────────────────────────
+    mon_df = df_lot[df_lot['MID_GROUP'] == 'Monitoring Sample']
+    if not mon_df.empty:
+        oper_summary = (mon_df.groupby('OPER_ID')['LOSS_QTY']
+                        .sum().reset_index().nlargest(2, 'LOSS_QTY'))
+        oper_parts = []
+        for _, row in oper_summary.iterrows():
+            oper_id = row['OPER_ID']
+            qty = int(row['LOSS_QTY'])
+            df_oper = mon_df[mon_df['OPER_ID'] == oper_id]
+            top_prods = (df_oper.groupby('PRODUCT_TYPE')['LOSS_QTY']
+                         .sum().reset_index().nlargest(2, 'LOSS_QTY'))
+            prod_str = " - " + ", ".join([f"{r['PRODUCT_TYPE']} {int(r['LOSS_QTY'])}매" for _, r in top_prods.iterrows()])
+            oper_parts.append(f"{oper_id} {qty}매{prod_str}")
+        result.append(f"- Monitoring Sample ({', '.join(oper_parts)})")
 
-            if not over20.empty:
-                top_oper = over20.iloc[0]
-                result.append(f"{code} 총 {total_qty}장 ({top_oper['OPER_ID']} 공정 {int(top_oper['LOSS_QTY'])}장 등 발췌)")
-            else:
-                result.append(f"{code} {total_qty}장 (20장 이상 공정 없음)")
+    # ──────────────────────────────────────────────────
+    # 4) Growing Engr Sample (SMPL)
+    # ──────────────────────────────────────────────────
+    smpl_df = df_lot[df_lot['MID_GROUP'] == 'Growing Engr Sample']
+    if not smpl_df.empty:
+        igot_summary = (smpl_df.groupby('IGOT_ID')['LOSS_QTY']
+                        .sum().reset_index().nlargest(2, 'LOSS_QTY'))
+        if not igot_summary.empty:
+            parts = [f"{row['IGOT_ID']} {int(row['LOSS_QTY'])}매" for _, row in igot_summary.iterrows()]
+            result.append(f"- Growing Engr Sample ({', '.join(parts)})")
 
-        # 2) ENGSFT, ENGSCT, ENGSIS → skip
-        elif code in ['ENGSFT', 'ENGSCT', 'ENGSIS']:
-            continue  # 보고서에서 제외 (의도된 스킵)
+    # ──────────────────────────────────────────────────
+    # 5) 기타 SAMPLE 코드 (MID_GROUP에 포함되지 않은 AFT_BAD_RSN_CD)
+    # ──────────────────────────────────────────────────
+    # set difference로 known AFT_BAD_RSN_CD 제거
+    known_list = ['ENGSFT', 'ENGSCT', 'ENGSIS', 'LOT_SMPL', 'LOT-SAMPLE', 'MON_SAMPLE', 'SMPL']
 
-        # 3) LOT_SMPL
-        elif code == 'LOT_SMPL':
-            grouped = (
-                df_code.groupby('PRODUCT_TYPE')['LOSS_QTY'] # PRODUCT_TYPE CUST_SITE_NM
-                .sum()
-                .reset_index()
-                .sort_values('LOSS_QTY', ascending=False)
-            )
-            if not grouped.empty:
-                top_site = grouped.iloc[0]
-                result.append(f"{code} 총 {total_qty}장 ({top_site['PRODUCT_TYPE']} {int(top_site['LOSS_QTY'])}장 등 발췌)")
-            else:
-                result.append(f"{code} {total_qty}장")
+    # 현재 df_lot의 AFT_BAD_RSN_CD 중, known_list에 없는 것만 추출
+    current_codes = df_lot['AFT_BAD_RSN_CD'].dropna().unique()
+    other_codes = [code for code in current_codes if code not in known_list]
 
-        # 4) SMPL
-        elif code == 'SMPL':
-            grouped = (
-                df_code.groupby('IGOT_ID')['LOSS_QTY']
-                .sum()
-                .reset_index()
-                .sort_values('LOSS_QTY', ascending=False)
-            )
-            over20 = grouped[grouped['LOSS_QTY'] >= 20]
-            if not over20.empty:
-                top_igot = over20.iloc[0]
-                result.append(f"SMPL (Growing Eng’r Sample) 총 {total_qty}장, {top_igot['IGOT_ID']} {int(top_igot['LOSS_QTY'])}장 등 발췌")
-            else:
-                result.append(f"SMPL (Growing Eng’r Sample) 총 {total_qty}장 (20장 이상 IGOT_ID 없음)")
+    if other_codes:
+        other_df = df_lot[df_lot['AFT_BAD_RSN_CD'].isin(other_codes)].copy()
+        
+        other_summary = other_df.groupby('AFT_BAD_RSN_CD')['LOSS_QTY'].sum().reset_index()
+        parts = [f"{row['AFT_BAD_RSN_CD']} {int(row['LOSS_QTY'])}매" for _, row in other_summary.iterrows()]
+        result.append(f"- 기타 Sample ({', '.join(parts)})")
 
-        # 5) 그 외 코드 (20장 이상인 경우만 출력)
-        else:
-            if total_qty >= 20:
-                result.append(f"{code} 총 {total_qty}장")
+    return result if len(result) > 1 else result + ["분석 없음"]
 
-    return result
+
+
+# def analyze_sample(df_lot):
+#     """
+#     SAMPLE 관련 AFT_BAD_RSN_CD 불량 유형 상세 분석
+#     - MOM_SAMPLE, LOT_SMPL, SMPL, 기타 등 구분하여 로직 처리
+#     - 상위 2개 코드만 분석 (LOSS_QTY 기준)
+#     """
+#     df_lot = df_lot[df_lot['REJ_GROUP'] == 'SAMPLE'].copy()
+#     result = ["[SAMPLE 분석]"]
+
+#     if df_lot.empty:
+#         result.append("SAMPLE 불량 데이터 없음")
+#         return result
+
+#     # AFT_BAD_RSN_CD별 LOSS_QTY 합계 → 상위 2개
+#     defect_sums = (
+#         df_lot.groupby('AFT_BAD_RSN_CD')['LOSS_QTY']
+#         .sum()
+#         .reset_index()
+#         .sort_values('LOSS_QTY', ascending=False)
+#         .head(2)
+#     )
+
+#     if defect_sums.empty:
+#         result.append("분석할 불량 데이터 없음")
+#         return result
+
+#     for _, row in defect_sums.iterrows():
+#         code = row['AFT_BAD_RSN_CD']
+#         total_qty = int(row['LOSS_QTY'])
+#         df_code = df_lot[df_lot['AFT_BAD_RSN_CD'] == code].copy()
+
+#         # 1) MON_SAMPLE
+#         if code == 'MON_SAMPLE':
+#             grouped = (
+#                 df_code.groupby('OPER_ID')['LOSS_QTY']
+#                 .sum()
+#                 .reset_index()
+#                 .sort_values('LOSS_QTY', ascending=False)
+#             )
+#             over20 = grouped[grouped['LOSS_QTY'] >= 20]
+
+#             if not over20.empty:
+#                 top_oper = over20.iloc[0]
+#                 result.append(f"{code} 총 {total_qty}장 ({top_oper['OPER_ID']} 공정 {int(top_oper['LOSS_QTY'])}장 등 발췌)")
+#             else:
+#                 result.append(f"{code} {total_qty}장 (20장 이상 공정 없음)")
+
+#         # 2) ENGSFT, ENGSCT, ENGSIS → skip
+#         elif code in ['ENGSFT', 'ENGSCT', 'ENGSIS']:
+#             continue  # 보고서에서 제외 (의도된 스킵)
+
+#         # 3) LOT_SMPL
+#         elif code == 'LOT_SMPL':
+#             grouped = (
+#                 df_code.groupby('PRODUCT_TYPE')['LOSS_QTY'] # PRODUCT_TYPE CUST_SITE_NM
+#                 .sum()
+#                 .reset_index()
+#                 .sort_values('LOSS_QTY', ascending=False)
+#             )
+#             if not grouped.empty:
+#                 top_site = grouped.iloc[0]
+#                 result.append(f"{code} 총 {total_qty}장 ({top_site['PRODUCT_TYPE']} {int(top_site['LOSS_QTY'])}장 등 발췌)")
+#             else:
+#                 result.append(f"{code} {total_qty}장")
+
+#         # 4) SMPL
+#         elif code == 'SMPL':
+#             grouped = (
+#                 df_code.groupby('IGOT_ID')['LOSS_QTY']
+#                 .sum()
+#                 .reset_index()
+#                 .sort_values('LOSS_QTY', ascending=False)
+#             )
+#             over20 = grouped[grouped['LOSS_QTY'] >= 20]
+#             if not over20.empty:
+#                 top_igot = over20.iloc[0]
+#                 result.append(f"SMPL (Growing Eng’r Sample) 총 {total_qty}장, {top_igot['IGOT_ID']} {int(top_igot['LOSS_QTY'])}장 등 발췌")
+#             else:
+#                 result.append(f"SMPL (Growing Eng’r Sample) 총 {total_qty}장 (20장 이상 IGOT_ID 없음)")
+
+#         # 5) 그 외 코드 (20장 이상인 경우만 출력)
+#         else:
+#             if total_qty >= 20:
+#                 result.append(f"{code} 총 {total_qty}장")
+
+#     return result
