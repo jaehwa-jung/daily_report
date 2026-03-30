@@ -29,7 +29,8 @@ QUERY_CONFIG = {
     'fac_ids': ['WF7', 'WF8', 'WFA', 'FPC7', 'FPC8'],
     'grade_filter': 'PN',  # 'PN' 또는 특정 등급
     'oper_div_l': 'WF',
-    'max_data_size_gb': 1.0  # EXPLAIN 체크 시 허용 최대 용량 
+    'max_data_size_gb': 1.0,  # EXPLAIN 체크 시 허용 최대 용량
+    'enabled_processes': ['wafering'],
     } 
 
 def get_last_3months_date_range(self, target_date_str=None):

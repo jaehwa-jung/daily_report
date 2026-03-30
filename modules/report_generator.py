@@ -71,6 +71,12 @@ logger.addHandler(file_handler)
 
 class DailyReportGenerator:
     _ms6_mapping_cache = None
+    DEFAULT_TOP3_GROUPS = ["BROKEN", "EDGE", "CHIP"]
+    SUPPORTED_TOP_GROUPS = ["PIT", "SCRATCH", "EDGE", "BROKEN", "CHIP", "VISUAL"]
+    BROKEN_SUBGROUPS = ["LAP_BROKEN", "EP_BROKEN", "DSP_BROKEN", "FP_BROKEN"]
+    CHIP_SUBGROUPS_TREND = ["CHIP-LAP", "EDGE-CHIP", "CHIP_EG1AF", "CHIP_EG1BF", "E_CHIP"]
+    CHIP_SUBGROUPS_WAF = ["CHIP-LAP", "EDGE-CHIP", "CHIP_EG1AF", "CHIP_EG1BF", "EDGE-ECHIP"]
+    DISPLAY_GROUPS = ["PIT", "SCRATCH", "EDGE", "BROKEN", "CHIP", "VISUAL"]
 
     def __init__(self, data):
         self.data = data
@@ -202,6 +208,25 @@ class DailyReportGenerator:
         안전하게 상위 3개 REJ_GROUP 목록 가져오기
         """
         return self.data.get('DATA_3210_wafering_300', {}).get('top3_rej_groups', [])
+
+    def _get_focus_rej_groups(self):
+        """리포트 시각화에 사용할 상위 REJ_GROUP 공통 조회."""
+        top3 = self._get_top3_rej_groups()
+        if not top3:
+            return self.DEFAULT_TOP3_GROUPS
+        return top3
+
+    def _expand_main_groups(self, groups, *, chip_subgroups):
+        """BROKEN/CHIP 확장 규칙 공통화."""
+        expanded = []
+        for g in groups:
+            if g == 'BROKEN' and g in self.SUPPORTED_TOP_GROUPS:
+                expanded.extend(self.BROKEN_SUBGROUPS)
+            elif g == 'CHIP' and g in self.SUPPORTED_TOP_GROUPS:
+                expanded.extend(chip_subgroups)
+            elif g in self.SUPPORTED_TOP_GROUPS:
+                expanded.append(g)
+        return expanded
 
     def _create_total_loss_ref(self):
         """6개월 전체 불량 기반 Ref 데이터 생성"""
@@ -2827,30 +2852,12 @@ class DailyReportGenerator:
         # ===================================================================
         # [2] top3_rej_groups 및 valid_groups 확인
         # ===================================================================
-        # top3_rej_groups = self.data.get('DATA_3210_wafering_300', {}).get('top3_rej_groups', [])
-        top3_rej_groups = ['BROKEN', 'EDGE', 'CHIP']
-        # 지원되는 상위 그룹 정의 (기존 조건 반영)
-        SUPPORTED_TOP_GROUPS = ['PIT', 'SCRATCH', 'EDGE', 'BROKEN', 'CHIP', 'VISUAL']
-
-        # 1. expanded_groups 생성 (BROKEN, CHIP 확장)
-        expanded_groups = []
-                    
-        for g in top3_rej_groups:
-            if g == 'BROKEN' and g in SUPPORTED_TOP_GROUPS:
-                expanded_groups.extend(['LAP_BROKEN', 'EP_BROKEN', 'DSP_BROKEN', 'FP_BROKEN'])
-            elif g == 'CHIP' and g in SUPPORTED_TOP_GROUPS:
-                expanded_groups.extend([
-                    'CHIP-LAP', 
-                    'EDGE-CHIP', 
-                    'CHIP_EG1AF', 
-                    'CHIP_EG1BF',
-                    'E_CHIP'
-                ])
-            elif g in SUPPORTED_TOP_GROUPS:
-                expanded_groups.append(g)
-            # else: 지원 안 함 → 무시
-
-        valid_groups = [g for g in expanded_groups]
+        top3_rej_groups = self._get_focus_rej_groups()
+        expanded_groups = self._expand_main_groups(
+            top3_rej_groups,
+            chip_subgroups=self.CHIP_SUBGROUPS_TREND,
+        )
+        valid_groups = list(expanded_groups)
 
         if not valid_groups:
             print("[WARNING] 유효한 REJ_GROUP 없음 → 그래프 생성 중단")
@@ -3109,6 +3116,71 @@ class DailyReportGenerator:
 
         return graph_paths
 
+
+
+    def _append_all_defect_sheet(self, wb, report):
+        """요구사항 #5: 상위 3개가 아닌 전체 불량(REJ_GROUP) 시트 추가."""
+        ws = wb.create_sheet("전체 불량 상세")
+
+        ws['A1'] = "[전체 REJ_GROUP 불량 현황]"
+        ws['A1'].font = Font(size=12, bold=True)
+
+        summary_df = report.get('DATA_3210_wafering_300_details', {}).get('summary')
+        if summary_df is None or getattr(summary_df, 'empty', True):
+            ws['A3'] = "데이터 없음"
+            ws['A3'].font = Font(size=10, color='FF0000')
+            return
+
+        all_df = summary_df[[
+            'REJ_GROUP', 'GOAL_RATIO_PCT', 'LOSS_RATIO_PCT', 'GAP_PCT'
+        ]].copy()
+        all_df = all_df.sort_values('GAP_PCT', ascending=False).reset_index(drop=True)
+
+        # 표 쓰기 (기존 시트 포맷은 건드리지 않고 신규 시트에만 추가)
+        start_row = 3
+        for c_idx, col in enumerate(all_df.columns, 1):
+            cell = ws.cell(row=start_row, column=c_idx, value=col)
+            cell.font = HEADER_FONT
+            cell.alignment = CENTER_WRAP
+            cell.fill = HEADER_FILL
+            cell.border = _BORDER_THIN
+
+        for r_idx, row in all_df.iterrows():
+            for c_idx, col in enumerate(all_df.columns, 1):
+                v = row[col]
+                cell = ws.cell(row=start_row + 1 + r_idx, column=c_idx, value=float(v) if col != 'REJ_GROUP' else str(v))
+                cell.font = BODY_FONT
+                cell.alignment = CENTER_WRAP
+                cell.border = _BORDER_THIN
+                if col in ['GOAL_RATIO_PCT', 'LOSS_RATIO_PCT', 'GAP_PCT']:
+                    cell.number_format = '0.00'
+
+        # 전체 불량 그래프 (신규 시트 전용)
+        fig, ax = plt.subplots(figsize=(12, 4))
+        x = np.arange(len(all_df))
+        bars_goal = ax.bar(x - 0.2, all_df['GOAL_RATIO_PCT'], 0.4, label='목표(%)', color='#4C78A8')
+        bars_loss = ax.bar(x + 0.2, all_df['LOSS_RATIO_PCT'], 0.4, label='실적(%)', color='#F58518')
+        ax.axhline(0, color='black', linewidth=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(all_df['REJ_GROUP'], rotation=70, ha='right')
+        ax.set_ylabel('불량률(%)')
+        ax.set_title('전체 REJ_GROUP 목표 vs 실적')
+        ax.legend(loc='upper right')
+
+        for bars in (bars_goal, bars_loss):
+            for b in bars:
+                h = b.get_height()
+                ax.text(b.get_x() + b.get_width() / 2, h, f"{h:.2f}", ha='center', va='bottom', fontsize=7)
+
+        img = fig_to_excel_image(fig, width=860, height=280, dpi=200)
+        ws.add_image(img, 'F3')
+        plt.close(fig)
+
+        # 열 너비
+        ws.column_dimensions['A'].width = 20
+        ws.column_dimensions['B'].width = 14
+        ws.column_dimensions['C'].width = 14
+        ws.column_dimensions['D'].width = 14
 
     def _export_to_excel(self, report, output_dir="./daily_reports_debug"):
         """Excel 보고서 생성 (기존 출력 형식과 동일하게 정확히 재현)"""
@@ -4398,26 +4470,11 @@ class DailyReportGenerator:
                     n //= 26
                 return result
 
-            # top3_rej_groups = report.get('DATA_3210_wafering_300_details', {}).get('top3_rej_groups', [])
-            top3_rej_groups = ['BROKEN', 'EDGE', 'CHIP']  # 원본 그룹 리스트
-            expanded_groups = []
-            
-            for g in top3_rej_groups:
-                if g == 'BROKEN':
-                    # BROKEN → 4개 공정별 하위 그룹으로 확장
-                    expanded_groups.extend(['LAP_BROKEN', 'EP_BROKEN', 'DSP_BROKEN', 'FP_BROKEN'])
-                elif g == 'CHIP':
-                    # CHIP → 세부 유형으로 확장 (시각화에 사용되는 실제 키)
-                    expanded_groups.extend([
-                        'CHIP-LAP', 
-                        'EDGE-CHIP', 
-                        'CHIP_EG1AF', 
-                        'CHIP_EG1BF',
-                        'EDGE-ECHIP' 
-                    ])
-                else:
-                    # 그 외: SCRATCH, EDGE 등은 그대로 유지
-                    expanded_groups.append(g)
+            top3_rej_groups = self._get_focus_rej_groups()
+            expanded_groups = self._expand_main_groups(
+                top3_rej_groups,
+                chip_subgroups=self.CHIP_SUBGROUPS_WAF,
+            )
 
             # waf_gap_data에 누락된 CHIP 그룹 추가 (빈 dict)
             for group in expanded_groups:
@@ -4814,14 +4871,13 @@ class DailyReportGenerator:
                     report['EQP_TREND_GRAPHS'] = eqp_graphs
                     print(f"[INFO] EQP_TREND_GRAPHS report에 복사됨: {list(eqp_graphs.keys())}")
 
-            # top3_rej_groups 가져오기
-            # top3_rej_groups = self.data.get('DATA_3210_wafering_300', {}).get('top3_rej_groups', [])
-            top3_rej_groups = ['BROKEN', 'EDGE', 'CHIP']
-            valid_groups = [g for g in top3_rej_groups if g in ['PIT', 'SCRATCH', 'EDGE', 'BROKEN', 'CHIP', 'VISUAL']]
+            # top3_rej_groups 가져오기 (데이터 우선, 없으면 기본값)
+            top3_rej_groups = self._get_focus_rej_groups()
+            valid_groups = [g for g in top3_rej_groups if g in self.SUPPORTED_TOP_GROUPS]
             eqp_trend_graphs = report.get('EQP_TREND_GRAPHS', {})
 
-            # SCRATCH, BROKEN, CHIP 순서 보장
-            display_groups = ['PIT', 'SCRATCH', 'EDGE', 'BROKEN', 'CHIP', 'VISUAL']
+            # 출력 순서 고정
+            display_groups = self.DISPLAY_GROUPS
 
             for rej_group in display_groups:
                 if rej_group not in valid_groups:
@@ -4830,12 +4886,12 @@ class DailyReportGenerator:
                 # BROKEN, CHIP은 하위 그룹 합쳐서 그래프 가져오기
                 paths = []
                 if rej_group == 'BROKEN':
-                    sub_groups = ['LAP_BROKEN', 'EP_BROKEN', 'DSP_BROKEN', 'FP_BROKEN']
+                    sub_groups = self.BROKEN_SUBGROUPS
                     for sg in sub_groups:
                         if sg in eqp_trend_graphs:
                             paths.extend(eqp_trend_graphs[sg])
                 elif rej_group == 'CHIP':
-                    sub_groups = ['CHIP-LAP', 'EDGE-CHIP', 'CHIP_EG1AF', 'CHIP_EG1BF', 'E_CHIP']
+                    sub_groups = self.CHIP_SUBGROUPS_TREND
                     for sg in sub_groups:
                         if sg in eqp_trend_graphs:
                             paths.extend(eqp_trend_graphs[sg])
@@ -4884,6 +4940,9 @@ class DailyReportGenerator:
             # 열 너비
             for col, width in zip('ABCDEFGHIJ', [15] + [12]*9):
                 ws.column_dimensions[col].width = width
+
+            # [추가] 전체 불량(REJ_GROUP 전체) 시트 생성
+            self._append_all_defect_sheet(wb, report)
 
             wb.save(str(excel_path))
             print(f"Excel 저장 성공: {excel_path}")
